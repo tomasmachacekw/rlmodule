@@ -1,4 +1,5 @@
-from typing import Sequence, Union
+
+from collections.abc import Sequence
 
 import gym
 import gymnasium
@@ -23,12 +24,16 @@ def get_output_size(module, input_shape):
     if contains_rnn_module(module, (nn.LSTM, nn.RNN, nn.GRU)):
         # TODO(ll) module.num_layer * bidirectional?
         dummy_hidden = torch.zeros(module.num_layers, 1, module.hidden_size)
-        return module(dummy_input, None, (dummy_hidden, dummy_hidden))[0].view(-1).shape[0]
+        if contains_rnn_module(module, nn.LSTM):
+            rnn_state = (dummy_hidden, dummy_hidden)  # (short-term [h], long-term [c])
+        else:  # RNN/GRU
+            rnn_state = dummy_hidden
+        return module(dummy_input, None, rnn_state)[0].view(-1).shape[0]
     else:
         return module(dummy_input).view(-1).shape[0]
 
 
-def get_cnn_shape(space: Union[int, Sequence[int], gym.Space, gymnasium.Space]):
+def get_cnn_shape(space: int | Sequence[int] | gym.Space | gymnasium.Space):
     """Experimental function to get shape of cnn input.
 
     :param space: Space or shape from which to obtain the number of elements
@@ -58,7 +63,7 @@ def get_cnn_shape(space: Union[int, Sequence[int], gym.Space, gymnasium.Space]):
 
 
 def get_space_size(
-    space: Union[int, Sequence[int], gym.Space, gymnasium.Space], number_of_elements: bool = True
+    space: int | Sequence[int] | gym.Space | gymnasium.Space, number_of_elements: bool = True
 ) -> int:
     """Get the size (number of elements) of a space
 

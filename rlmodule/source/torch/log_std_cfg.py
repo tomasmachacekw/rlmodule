@@ -1,16 +1,11 @@
-from typing import List, Optional
 
 from dataclasses import MISSING
 
-from rlmodule.source.log_std import CombinedLogStd, LogStd, NNLogStd, ParameterLogStd
-from rlmodule.source.network_cfg import MlpCfg
+from rlmodule.source.torch.log_std import CombinedLogStd, LogStd, NNLogStd, ParameterLogStd
+from rlmodule.source.torch.network_cfg import MlpCfg
 
 
-# use isaac-lab native configclass if available to avoid double declaration
-try:
-    from omni.isaac.lab.utils import configclass
-except ImportError:
-    from rlmodule.source.nvidia_utils import configclass
+from rlmodule.source.nvidia_utils import configclass
 
 
 @configclass
@@ -45,7 +40,7 @@ class NNLogStdCfg(LogStdCfg):
 
     class_type: type[LogStd] = NNLogStd
 
-    network_cfg: Optional[MlpCfg] = None
+    network_cfg: MlpCfg | None = None
     """
     Config for the hidden part of the network.
 
@@ -73,8 +68,8 @@ class CombinedLogStdCfg(LogStdCfg):
     - min
     """
 
-    combined_modules: List[LogStdCfg] = MISSING
+    combined_modules: list[LogStdCfg] = MISSING
     """List of modules to be combined."""
 
-    combination_constants: Optional[List[float]] = None
+    combination_constants: list[float] | None = None
     """List of constants used to multiple Std from each module before combination."""

@@ -1,4 +1,3 @@
-from typing import Union
 
 from functools import reduce
 from itertools import repeat
@@ -10,7 +9,7 @@ import torch.nn as nn
 class LogStd(nn.Module):
     """Base class that defines interface for standard deviation computation in GaussianLayer."""
 
-    def __init__(self, device: Union[str, torch.device], input_size: int, output_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, output_size: int, cfg):
         """Initialize Standard deviation computation module."""
         super().__init__()
         self.device = device
@@ -40,7 +39,7 @@ class ParameterLogStd(LogStd):
     action.
     """
 
-    def __init__(self, device: Union[str, torch.device], input_size: int, output_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, output_size: int, cfg):
         """Initialize Standard deviation computation module."""
         super().__init__(device, input_size, output_size, cfg)
 
@@ -61,7 +60,7 @@ class NNLogStd(LogStd):
         Currently support only MLP.
     """
 
-    def __init__(self, device: Union[str, torch.device], input_size: int, output_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, output_size: int, cfg):
         """Initialize Standard deviation computation module."""
         super().__init__(device, input_size, output_size, cfg)
 
@@ -99,7 +98,7 @@ class CombinedLogStd(LogStd):
     insufficient exploration in other states.
     """
 
-    def __init__(self, device: Union[str, torch.device], input_size: int, output_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, output_size: int, cfg):
         super().__init__(device, input_size, output_size, cfg)
 
         self._modules = [

@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import os
 from datetime import datetime
@@ -34,12 +33,12 @@ class DummyEnv(gym.Env):
         # Define action space: Continuous values between -1.0 and 1.0, with 6 action dimensions
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
 
-    def reset(self) -> Tuple[np.ndarray, dict]:
+    def reset(self) -> tuple[np.ndarray, dict]:
         # Reset environment and return initial random observation
         observation = self._get_random_observation()
         return observation, {}
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         # Create a new random observation
         observation = self._get_random_observation()
         reward = 0.0  # No meaningful reward in this dummy environment

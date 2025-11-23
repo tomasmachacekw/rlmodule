@@ -1,20 +1,14 @@
-from typing import Sequence, Union
 
+from collections.abc import Sequence
 from dataclasses import MISSING
 import gym
 import gymnasium
 
 import torch.nn as nn
 
-from rlmodule.source.log_std_cfg import LogStdCfg, ParameterLogStdCfg
-from rlmodule.source.output_layer import DeterministicLayer, GaussianLayer
-
-
-# use isaac-lab native configclass if available to avoid double declaration
-try:
-    from omni.isaac.lab.utils import configclass
-except ImportError:
-    from rlmodule.source.nvidia_utils import configclass
+from rlmodule.source.torch.log_std_cfg import LogStdCfg, ParameterLogStdCfg
+from rlmodule.source.torch.output_layer import DeterministicLayer, GaussianLayer
+from rlmodule.source.nvidia_utils import configclass
 
 
 @configclass
@@ -22,7 +16,7 @@ class OutputLayerCfg:
     class_type: type[nn.Module] = MISSING
     """Descendant class of the OutputLayer class implementing corresponding layer."""
 
-    output_size: Union[int, Sequence[int], gym.Space, gymnasium.Space] = None
+    output_size: int | Sequence[int] | gym.Space | gymnasium.Space = None
     """Output size of the output layer. Usually an action (sub)space.
     Can be kept as None if the value is set during execution time.
     """
@@ -62,5 +56,5 @@ class DeterministicLayerCfg(OutputLayerCfg):
     """
 
     class_type: type[DeterministicLayer] = DeterministicLayer
-    output_size: Union[int, Sequence[int], gym.Space, gymnasium.Space] = 1
+    output_size: int | Sequence[int] | gym.Space | gymnasium.Space = 1
     output_activation: nn.Module = nn.Identity

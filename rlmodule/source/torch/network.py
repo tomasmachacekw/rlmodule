@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from rlmodule.source.utils import get_cnn_shape
+from rlmodule.source.torch.utils import get_cnn_shape
 
 
 class MLP(nn.Module):

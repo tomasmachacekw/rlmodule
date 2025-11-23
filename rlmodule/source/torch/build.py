@@ -1,4 +1,4 @@
-from rlmodule.source.rlmodel_cfg import BaseRLCfg, RLModelCfg, SharedRLModelCfg
+from rlmodule.source.torch.rlmodel_cfg import BaseRLCfg, RLModelCfg, SharedRLModelCfg
 from rlmodule.source.utils import get_output_size, get_space_size
 
 

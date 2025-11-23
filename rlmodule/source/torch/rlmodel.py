@@ -1,17 +1,19 @@
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Any
+
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
 
 from rlmodule import logger
 
-from .model import Model
+from rlmodule.source.torch.model import Model
 
 
 class RLModel(Model):
     def __init__(
         self,
-        device: Union[str, torch.device],
+        device: str | torch.device,
         network: nn.Module,
         output_layer: nn.Module,
     ):
@@ -22,8 +24,8 @@ class RLModel(Model):
         self._output_layer = output_layer
 
     def forward(
-        self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None], Mapping[str, Union[torch.Tensor, Any]]]:
+        self, inputs: Mapping[str, torch.Tensor | Any], role: str = ""
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Mapping[str, torch.Tensor | Any]]:
 
         if self._input_actions:
             states = torch.cat((inputs["states"], inputs["taken_actions"]), dim=1)
@@ -41,10 +43,10 @@ class RLModel(Model):
 class SharedRLModel(Model):
     def __init__(
         self,
-        device: Union[str, torch.device],
+        device: str | torch.device,
         network: nn.Module,
-        policy_output_layer: Optional[nn.Module],
-        value_output_layer: Optional[nn.Module],
+        policy_output_layer: nn.Module | None,
+        value_output_layer: nn.Module | None,
     ):
         # TODO(ll) description
         """Shared Reinforcement learning model."""
@@ -59,14 +61,14 @@ class SharedRLModel(Model):
 
         # caching for shared forward pass for policy and value roles
         self._cached_states = None
-        self._cached_outputs = None
+        self._cached_output = None
 
     def _have_cached_states(self, states):
         return self._cached_states is not None and torch.equal(self._cached_states, states)
 
     def forward(
-        self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None], Mapping[str, Union[torch.Tensor, Any]]]:
+        self, inputs: Mapping[str, torch.Tensor | Any], role: str = ""
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Mapping[str, torch.Tensor | Any]]:
 
         states = inputs["states"]
 

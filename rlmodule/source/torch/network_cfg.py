@@ -1,6 +1,5 @@
-from typing import Sequence, Union
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import MISSING
 import gym
 import gymnasium
@@ -8,25 +7,18 @@ import gymnasium
 import torch.nn as nn
 
 from rlmodule import logger
-from rlmodule.source.network import CNN, GRU, LSTM, MLP, RNN, RnnBase, RnnMlp
-
-
-# use isaac-lab native configclass if available to avoid it being declared twice
-try:
-    from omni.isaac.lab.utils import configclass
-except ImportError:
-    logger.info("Importing local configclass.")
-    from rlmodule.source.nvidia_utils import configclass
+from rlmodule.source.torch.network import CNN, GRU, LSTM, MLP, RNN, RnnBase, RnnMlp
+from rlmodule.source.nvidia_utils import configclass
 
 
 @configclass
 class NetworkCfg:
-    module: Union[nn.Module, Callable[..., nn.Module]] = MISSING
+    module: nn.Module | Callable[..., nn.Module] = MISSING
     input_size: int = None
     """Size of all network inputs. This field should be automatically derived from input_states/input_actions."""
-    input_states: Union[int, Sequence[int], gym.Space, gymnasium.Space] = None
+    input_states: int | Sequence[int] | gym.Space | gymnasium.Space = None
     """Observations passed to the network as an input."""
-    input_actions: Union[int, Sequence[int], gym.Space, gymnasium.Space] = None
+    input_actions: int | Sequence[int] | gym.Space | gymnasium.Space = None
     """Action passed to the network as an input. If it is None, actions will not be passed."""
 
 

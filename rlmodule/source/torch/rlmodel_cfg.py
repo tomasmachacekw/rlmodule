@@ -1,32 +1,23 @@
-from typing import Optional, Union
-
 from dataclasses import MISSING
-
 import torch
 import torch.nn as nn
 
-from rlmodule.source.output_layer_cfg import GaussianLayerCfg, OutputLayerCfg
-from rlmodule.source.rlmodel import RLModel, SharedRLModel
-
-
-# use isaac-lab native configclass if available to avoid it being declared twice
-try:
-    from omni.isaac.lab.utils import configclass
-except ImportError:
-    from rlmodule.source.nvidia_utils import configclass
-
+from rlmodule.source.nvidia_utils import configclass
+from rlmodule.source.torch.output_layer_cfg import GaussianLayerCfg, OutputLayerCfg
+from rlmodule.source.torch.rlmodel import RLModel, SharedRLModel
 
 @configclass
 class BaseRLCfg:
+
     class_type: type[RLModel] = MISSING
     network: nn.Module = MISSING
-    device: Optional[Union[str, torch.device]] = MISSING
+    device: str| torch.device | None = MISSING
 
 
 @configclass
 class RLModelCfg(BaseRLCfg):
     class_type: type[RLModel] = RLModel
-    output_layer: type[OutputLayerCfg] = GaussianLayerCfg()
+    output_layer: OutputLayerCfg = GaussianLayerCfg()
 
 
 @configclass
@@ -45,6 +36,8 @@ class SeparatedRLModelCfg:
     """Convenience class to hold two separate instances of RLModelCfg. One for policy and one for value (or critic)."""
 
     policy: RLModelCfg = MISSING
-    """Hold configuration of policy model"""
+    """Hold configuration of policy model."""
+
     value: RLModelCfg = MISSING
-    """Hold configuration of value (or critic) model"""
+    """Hold configuration of value (or critic) model."""
+

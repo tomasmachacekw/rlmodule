@@ -1,4 +1,3 @@
-from typing import Union
 
 import gym
 import gymnasium
@@ -7,11 +6,11 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rlmodule.source.utils import get_space_size
+from rlmodule.source.torch.utils import get_space_size
 
 
 class OutputLayer(nn.Module):
-    def __init__(self, device: Union[str, torch.device], input_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, cfg):
         """Base class for OutputLayer class hierarchy."""
         super().__init__()
         self.device = device
@@ -33,7 +32,7 @@ class OutputLayer(nn.Module):
 
 
 class GaussianLayer(OutputLayer):
-    def __init__(self, device: Union[str, torch.device], input_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, cfg):
         """Gaussian output layer
 
         :param device: Device on which a tensor/array is or will be allocated
@@ -185,7 +184,7 @@ class GaussianLayer(OutputLayer):
 
 
 class DeterministicLayer(OutputLayer):
-    def __init__(self, device: Union[str, torch.device], input_size: int, cfg):
+    def __init__(self, device: str | torch.device, input_size: int, cfg):
         """Deterministic output layer
 
         :param device: Device on which a tensor/array is or will be allocated

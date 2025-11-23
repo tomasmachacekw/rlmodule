@@ -1,18 +1,19 @@
-from typing import Any, Mapping, Optional, Tuple, Union
+from __future__ import annotations
 
-import collections
+from typing import Any
+
+from collections.abc import Mapping
 import gym
 import gymnasium
-
 import torch
 import torch.nn as nn
 
 from rlmodule import logger
-from rlmodule.source.utils import contains_rnn_module
+from rlmodule.source.torch.utils import contains_rnn_module
 
 
 class Model(torch.nn.Module):
-    def __init__(self, device: Union[str, torch.device], network: nn.Module) -> None:
+    def __init__(self, device: str | torch.device, network: nn.Module) -> None:
         """Base class representing a function approximator"""
         super().__init__()
 
@@ -134,8 +135,8 @@ class Model(torch.nn.Module):
             return {}
 
     def tensor_to_space(
-        self, tensor: torch.Tensor, space: Union[gym.Space, gymnasium.Space], start: int = 0
-    ) -> Union[torch.Tensor, dict]:
+        self, tensor: torch.Tensor, space: gym.Space | gymnasium.Space, start: int = 0
+    ) -> torch.Tensor | dict:
         """Map a flat tensor to a Gym/Gymnasium space
 
         The mapping is done in the following way:
@@ -195,8 +196,8 @@ class Model(torch.nn.Module):
         raise ValueError(f"Space type {type(space)} not supported")
 
     def random_act(
-        self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, None, Mapping[str, Union[torch.Tensor, Any]]]:
+        self, inputs: Mapping[str, torch.Tensor | Any], role: str = ""
+    ) -> tuple[torch.Tensor, None, Mapping[str, torch.Tensor | Any]]:
         """Act randomly according to the action space
 
         :param inputs: Model inputs. The most common keys are:
@@ -331,8 +332,8 @@ class Model(torch.nn.Module):
         _update_biases(self.children(), method_name, args, kwargs)
 
     def forward(
-        self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None], Mapping[str, Union[torch.Tensor, Any]]]:
+        self, inputs: Mapping[str, torch.Tensor | Any], role: str = ""
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Mapping[str, torch.Tensor | Any]]:
         """Forward pass of the model
 
         Implementation of this method manages calling forward passes of all its components.
@@ -353,8 +354,8 @@ class Model(torch.nn.Module):
         raise NotImplementedError("The action to be taken by the agent (.forward()) is not implemented")
 
     def act(
-        self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None], Mapping[str, Union[torch.Tensor, Any]]]:
+        self, inputs: Mapping[str, torch.Tensor | Any], role: str = ""
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Mapping[str, torch.Tensor | Any]]:
         """This method calls the ``.forward()`` method and returns its outputs
 
         :param inputs: Model inputs. The most common keys are:
@@ -389,7 +390,7 @@ class Model(torch.nn.Module):
         else:
             raise ValueError("Invalid mode. Use 'train' for training or 'eval' for evaluation")
 
-    def save(self, path: str, state_dict: Optional[dict] = None) -> None:
+    def save(self, path: str, state_dict: dict | None = None) -> None:
         """Save the model to the specified path
 
         :param path: Path to save the model to
@@ -433,8 +434,8 @@ class Model(torch.nn.Module):
 
     def migrate(
         self,
-        state_dict: Optional[Mapping[str, torch.Tensor]] = None,
-        path: Optional[str] = None,
+        state_dict: Mapping[str, torch.Tensor] | None = None,
+        path: str | None = None,
         name_map: Mapping[str, str] = {},
         auto_mapping: bool = True,
         verbose: bool = False,
