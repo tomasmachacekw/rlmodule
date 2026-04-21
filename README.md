@@ -44,6 +44,14 @@ Note: sometimes installation may fail, if there is a run/ dir present, you may n
 rm -rf runs
 ```
 
+### Deep policies: LayerNorm and Residual MLPs
+
+`rlmodule` supports per-layer LayerNorm on `MlpCfg` and a SimBa-style residual
+MLP (`ResidualMlpCfg`). These work for both separated and shared
+architectures, with independent per-head granularity via the new
+`OutputLayerCfg.head` field. See [docs/layer_norm_and_residual.md](docs/layer_norm_and_residual.md)
+for motivation, references, and copy-pasteable cfg snippets.
+
 ### Run chosen example
 ```
 python3 rlmodule/skrl/torch/examples/gymnasium/pendulum_ppo_mlp_separate_model.py

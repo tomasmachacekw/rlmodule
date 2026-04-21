@@ -7,7 +7,25 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rlmodule.source.utils import get_space_size
+from rlmodule.source.utils import get_output_size, get_space_size
+
+
+def _build_head(cfg, input_size: int) -> tuple[nn.Module, int]:
+    """Build the optional pre-projection head MLP.
+
+    Returns a tuple of ``(head_module, projection_in_features)``. When
+    ``cfg.head`` is ``None`` this returns ``(nn.Identity(), input_size)`` so
+    the caller can feed the projection straight from the trunk output.
+    """
+    head_cfg = getattr(cfg, "head", None)
+    if head_cfg is None:
+        return nn.Identity(), input_size
+
+    head_cfg = head_cfg.copy()
+    head_cfg.input_size = input_size
+    head_module = head_cfg.module(head_cfg)
+    projection_in = get_output_size(head_module, input_size)
+    return head_module, projection_in
 
 
 class OutputLayer(nn.Module):
@@ -30,6 +48,9 @@ class OutputLayer(nn.Module):
         self._output_size = get_space_size(cfg.output_size)
 
         self._output_scale = cfg.output_scale
+
+        # Optional pre-projection head MLP (see OutputLayerCfg.head).
+        self._head, self._projection_in = _build_head(cfg, input_size)
 
 
 class GaussianLayer(OutputLayer):
@@ -59,9 +80,9 @@ class GaussianLayer(OutputLayer):
             else torch.sum if cfg.reduction == "sum" else torch.prod if cfg.reduction == "prod" else None
         )
 
-        self._net = nn.Sequential(nn.Linear(self._input_size, self._output_size), cfg.output_activation())
+        self._net = nn.Sequential(nn.Linear(self._projection_in, self._output_size), cfg.output_activation())
 
-        self._log_std = cfg.log_std.class_type(device, input_size, self._output_size, cfg.log_std)
+        self._log_std = cfg.log_std.class_type(device, self._projection_in, self._output_size, cfg.log_std)
 
     def forward(self, input, taken_actions, outputs_dict):
         """Act stochastically in response to the state of the environment
@@ -87,11 +108,14 @@ class GaussianLayer(OutputLayer):
             >>> print(actions.shape, log_prob.shape, outputs["mean_actions"].shape)
             torch.Size([4096, 8]) torch.Size([4096, 1]) torch.Size([4096, 8])
         """
+        # Optional per-head pre-projection (see OutputLayerCfg.head).
+        head_out = self._head(input)
+
         mean_actions = self._output_scale * self._net(
-            input
+            head_out
         )  # TODO in skrl example the self._cfg.output_scale * is done here. -> why understand this (is it correct).
 
-        self._cached_log_std = self._log_std(input)
+        self._cached_log_std = self._log_std(head_out)
         self._num_samples = mean_actions.shape[0]
 
         # distribution
@@ -198,7 +222,7 @@ class DeterministicLayer(OutputLayer):
 
         super().__init__(device, input_size, cfg)
 
-        self._net = nn.Sequential(nn.Linear(input_size, cfg.output_size), cfg.output_activation())
+        self._net = nn.Sequential(nn.Linear(self._projection_in, cfg.output_size), cfg.output_activation())
 
     def forward(self, input, taken_actions, outputs_dict):
         """Act deterministically in response to the state of the environment
@@ -223,7 +247,10 @@ class DeterministicLayer(OutputLayer):
             torch.Size([4096, 1]) {}
         """
 
-        actions = self._output_scale * self._net(input)
+        # Optional per-head pre-projection (see OutputLayerCfg.head).
+        head_out = self._head(input)
+
+        actions = self._output_scale * self._net(head_out)
 
         if self._clip_actions:
             actions = torch.clamp(actions, min=self._clip_actions_min, max=self._clip_actions_max)

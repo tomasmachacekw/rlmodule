@@ -59,10 +59,31 @@ class SharedRLModel(Model):
 
         # caching for shared forward pass for policy and value roles
         self._cached_states = None
-        self._cached_outputs = None
+        self._cached_output = None
 
     def _have_cached_states(self, states):
-        return self._cached_states is not None and torch.equal(self._cached_states, states)
+        # Identity check is enough: SKRL passes the same `sampled_states`
+        # reference to the policy and value role calls within a minibatch.
+        # Using ``torch.equal`` here would force an O(N) value compare and a
+        # host sync on CUDA, and would also risk hitting a stale autograd
+        # graph if two different minibatches happened to share values.
+        return self._cached_states is not None and self._cached_states is states
+
+    def _reset_cache(self) -> None:
+        """Drop references to the last forward's outputs.
+
+        This is important for memory: the cached tuple holds the trunk output
+        and (for RNN backbones) the hidden-state tensors ``h_n`` / ``c_n``.
+        After ``loss.backward()`` frees the graph these tensors are still
+        allocated until we drop the reference. We release them on cache miss
+        and on any train/eval mode switch.
+        """
+        self._cached_states = None
+        self._cached_output = None
+
+    def train(self, mode: bool = True):
+        self._reset_cache()
+        return super().train(mode)
 
     def forward(
         self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
@@ -71,6 +92,12 @@ class SharedRLModel(Model):
         states = inputs["states"]
 
         if not self._have_cached_states(states):
+            # Drop the old cache BEFORE computing the new forward, so the
+            # previous minibatch's activations (and any RNN h_n/c_n dangling
+            # in ``output_dict["rnn"]``) are released before the new forward
+            # allocates.
+            self._reset_cache()
+
             if self._rnn:
                 output, output_dict = self._net(states, inputs.get("terminated", None), inputs["rnn"])
             else:

@@ -109,29 +109,47 @@ class Model(torch.nn.Module):
             >>> model.get_specification()
             {'rnn': {'sizes': [(1, 4, 64), (1, 4, 64)]}}
         """
-        if self._lstm:
+        if self._lstm or self._rnn:
+            num_layers = self._net.num_layers
+            num_envs = self._net.num_envs
+            hidden_size = self._net.hidden_size
+            # ``num_envs`` is only used here to size the SKRL-side hidden-state
+            # buffer; it MUST match the trainer's vector-env count. If it's
+            # misconfigured (<= 0 or inconsistent), SKRL silently allocates a
+            # wrong-sized tensor and the mismatch only surfaces later inside
+            # the LSTM/RNN forward as an opaque shape error. Catch it here.
+            if num_envs is None or num_envs <= 0:
+                raise ValueError(
+                    f"RnnBaseCfg.num_envs must be a positive integer matching the trainer's "
+                    f"vector-env count; got {num_envs!r}."
+                )
+            if num_layers is None or num_layers <= 0:
+                raise ValueError(
+                    f"RnnBaseCfg.num_layers must be a positive integer; got {num_layers!r}."
+                )
+            if hidden_size is None or hidden_size <= 0:
+                raise ValueError(
+                    f"RnnBaseCfg.hidden_size must be a positive integer; got {hidden_size!r}."
+                )
+
+            size = (num_layers, num_envs, hidden_size)
+            if self._lstm:
+                return {
+                    "rnn": {
+                        "sequence_length": self._net.sequence_length,
+                        # hidden states (D * num_layers, N, Hout)
+                        # cell states   (D * num_layers, N, Hcell)
+                        "sizes": [size, size],
+                    }
+                }
             return {
                 "rnn": {
                     "sequence_length": self._net.sequence_length,
-                    "sizes": [
-                        (
-                            self._net.num_layers,
-                            self._net.num_envs,
-                            self._net.hidden_size,
-                        ),  # hidden states (D ∗ num_layers, N, Hout)
-                        (self._net.num_layers, self._net.num_envs, self._net.hidden_size),
-                    ],
+                    # hidden states (D * num_layers, N, Hout)
+                    "sizes": [size],
                 }
-            }  # cell states   (D ∗ num_layers, N, Hcell)
-        elif self._rnn:
-            return {
-                "rnn": {
-                    "sequence_length": self._net.sequence_length,
-                    "sizes": [(self._net.num_layers, self._net.num_envs, self._net.hidden_size)],
-                }
-            }  # hidden states (D ∗ num_layers, N, Hout)
-        else:
-            return {}
+            }
+        return {}
 
     def tensor_to_space(
         self, tensor: torch.Tensor, space: Union[gym.Space, gymnasium.Space], start: int = 0

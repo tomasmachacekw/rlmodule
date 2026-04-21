@@ -94,3 +94,9 @@ sections = [
 ]
 no_lines_before = "THIRDPARTY"
 skip = ["docs"]
+
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: marks tests as slow (skip with: -m 'not slow')",
+]

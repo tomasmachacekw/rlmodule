@@ -1,4 +1,4 @@
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
 
 from dataclasses import MISSING
 import gym
@@ -7,6 +7,7 @@ import gymnasium
 import torch.nn as nn
 
 from rlmodule.source.log_std_cfg import LogStdCfg, ParameterLogStdCfg
+from rlmodule.source.network_cfg import NetworkCfg
 from rlmodule.source.output_layer import DeterministicLayer, GaussianLayer
 
 
@@ -35,6 +36,25 @@ class OutputLayerCfg:
 
     clip_actions: bool = False
     """Flag to indicate whether the actions should be clipped. Only supported for gym/gymnasium space"""
+
+    head: Optional[NetworkCfg] = None
+    """Optional per-head network inserted between the trunk and the final projection.
+
+    When this is ``None`` (default), the output layer is exactly a single ``Linear``
+    followed by ``output_activation`` - i.e. the original behaviour, preserved for
+    backwards compatibility.
+
+    When this is set (typically to an :class:`rlmodule.source.network_cfg.MlpCfg`
+    or :class:`rlmodule.source.network_cfg.ResidualMlpCfg`), it becomes a dedicated
+    "head" MLP that runs between the shared trunk and the final output projection.
+    This is the mechanism that lets a ``SharedRLModelCfg`` express:
+
+        shared_trunk -> actor_head  -> Linear -> Gaussian
+                     -> critic_head -> Linear -> Deterministic
+
+    with independently configured per-layer LayerNorm and/or residual structure
+    on each head (see the references on ``ResidualMlp`` for motivation).
+    """
 
 
 @configclass
