@@ -23,16 +23,28 @@ class RLModel(Model):
 
     def forward(
         self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None], Mapping[str, Union[torch.Tensor, Any]]]:
+    ) -> Tuple[torch.Tensor, Mapping[str, Union[torch.Tensor, Any]]]:
+        """Forward the trunk + output layer.
 
+        SKRL 2.x agents pass the trunk input under
+        ``inputs["observations"]`` and reserve ``inputs["states"]``
+        for asymmetric actor-critic state info (often ``None``).
+        SKRL 1.x only had ``inputs["states"]``. We accept both for
+        backwards compatibility: prefer ``"observations"`` and fall
+        back to ``"states"`` if the caller is still using the 1.x
+        naming. The result follows the 2.x 2-tuple
+        ``(actions, outputs_dict)`` contract.
+        """
+
+        trunk_input = inputs.get("observations")
+        if trunk_input is None:
+            trunk_input = inputs["states"]
         if self._input_actions:
-            states = torch.cat((inputs["states"], inputs["taken_actions"]), dim=1)
-        else:
-            states = inputs["states"]
+            trunk_input = torch.cat((trunk_input, inputs["taken_actions"]), dim=1)
         if self._rnn:
-            output, output_dict = self._net(states, inputs.get("terminated", None), inputs["rnn"])
+            output, output_dict = self._net(trunk_input, inputs.get("terminated", None), inputs["rnn"])
         else:
-            output = self._net(states)
+            output = self._net(trunk_input)
             output_dict = {}
 
         return self._output_layer(output, inputs.get("taken_actions", None), output_dict)
@@ -87,9 +99,18 @@ class SharedRLModel(Model):
 
     def forward(
         self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None], Mapping[str, Union[torch.Tensor, Any]]]:
+    ) -> Tuple[torch.Tensor, Mapping[str, Union[torch.Tensor, Any]]]:
+        """Forward the shared trunk and dispatch to a per-role head.
 
-        states = inputs["states"]
+        See :meth:`RLModel.forward` for the ``observations`` vs
+        ``states`` key contract. The shared trunk runs once per
+        unique input tensor and the cached output is dispatched to
+        the policy or value head based on ``role``.
+        """
+
+        states = inputs.get("observations")
+        if states is None:
+            states = inputs["states"]
 
         if not self._have_cached_states(states):
             # Drop the old cache BEFORE computing the new forward, so the

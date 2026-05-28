@@ -214,27 +214,27 @@ class Model(torch.nn.Module):
 
     def random_act(
         self, inputs: Mapping[str, Union[torch.Tensor, Any]], role: str = ""
-    ) -> Tuple[torch.Tensor, None, Mapping[str, Union[torch.Tensor, Any]]]:
-        """Act randomly according to the action space
+    ) -> Tuple[torch.Tensor, Mapping[str, Union[torch.Tensor, Any]]]:
+        """Act randomly according to the action space.
 
-        :param inputs: Model inputs. The most common keys are:
-
-                       - ``"states"``: state of the environment used to make the decision
-                       - ``"taken_actions"``: actions taken by the policy for the given states
-        :type inputs: dict where the values are typically torch.Tensor
-        :param role: Role play by the model (default: ``""``)
-        :type role: str, optional
-
-        :raises NotImplementedError: Unsupported action space
-
-        :return: Model output. The first component is the action to be taken by the agent
-        :rtype: tuple of torch.Tensor, None, and dict
+        Returns a 2-tuple ``(actions, outputs_dict)`` matching the
+        SKRL 2.x model.act contract; the action-space dispatch is
+        unchanged from 1.x.
         """
+
+        # Pull the batch shape from whichever input the agent provided.
+        # 2.x agents typically pass ``observations``; older callers may
+        # still pass ``states``.
+        anchor = inputs.get("observations")
+        if anchor is None:
+            anchor = inputs.get("states")
+        batch_size = anchor.shape[0]
+
         # discrete action space (Discrete)
         if issubclass(type(self.action_space), gym.spaces.Discrete) or issubclass(
             type(self.action_space), gymnasium.spaces.Discrete
         ):
-            return torch.randint(self.action_space.n, (inputs["states"].shape[0], 1), device=self.device), None, {}
+            return torch.randint(self.action_space.n, (batch_size, 1), device=self.device), {}
         # continuous action space (Box)
         elif issubclass(type(self.action_space), gym.spaces.Box) or issubclass(
             type(self.action_space), gymnasium.spaces.Box
@@ -246,8 +246,7 @@ class Model(torch.nn.Module):
                 )
 
             return (
-                self._random_distribution.sample(sample_shape=(inputs["states"].shape[0], self.num_actions)),
-                None,
+                self._random_distribution.sample(sample_shape=(batch_size, self.num_actions)),
                 {},
             )
         else:
@@ -391,14 +390,17 @@ class Model(torch.nn.Module):
         return self.forward(inputs, role)
 
     def set_mode(self, mode: str) -> None:
-        """Set the model mode (training or evaluation)
+        """Set the model mode (training or evaluation).
 
-        :param mode: Mode: ``"train"`` for training or ``"eval"`` for evaluation.
-            See `torch.nn.Module.train
-            <https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.train>`_
-        :type mode: str
+        Legacy 1.x-style accessor; SKRL 2.x agents call
+        :meth:`enable_training_mode` instead.
 
-        :raises ValueError: If the mode is not ``"train"`` or ``"eval"``
+        :param mode: Mode: ``"train"`` for training or ``"eval"`` for
+            evaluation. See :py:meth:`torch.nn.Module.train` for
+            details.
+
+        :raises ValueError: If the mode is not ``"train"`` or
+            ``"eval"``.
         """
         if mode == "train":
             self.train(True)
@@ -406,6 +408,18 @@ class Model(torch.nn.Module):
             self.train(False)
         else:
             raise ValueError("Invalid mode. Use 'train' for training or 'eval' for evaluation")
+
+    def enable_training_mode(self, enabled: bool = True) -> None:
+        """SKRL 2.x compatibility shim that mirrors :meth:`set_mode`.
+
+        SKRL 1.x called ``model.set_mode("train" | "eval")``; SKRL 2.x
+        instead calls ``model.enable_training_mode(True | False)`` from
+        ``Agent.enable_models_training_mode``. Keeping both methods
+        lets the same ``Model`` subclass work against either skrl
+        major version without divergent caller code.
+        """
+
+        self.train(enabled)
 
     def save(self, path: str, state_dict: Optional[dict] = None) -> None:
         """Save the model to the specified path

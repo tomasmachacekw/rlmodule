@@ -46,7 +46,7 @@ def test_deterministic_with_mlp_head_rewires_final_projection():
 
     # Forward produces correct output.
     x = torch.randn(5, 64)
-    out, _, extras = layer(x, None, {})
+    out, extras = layer(x, None, {})
     assert out.shape == (5, 1)
     assert extras == {}
 
@@ -70,8 +70,9 @@ def test_gaussian_with_residual_head():
     assert last_linear.in_features == 64
 
     x = torch.randn(3, 128)
-    actions, log_prob, extras = layer(x, None, {})
+    actions, extras = layer(x, None, {})
     assert actions.shape == (3, 6)
+    log_prob = extras["log_prob"]
     assert log_prob.shape == (3, 1)
 
 

@@ -21,11 +21,12 @@ import torch.nn as nn
 import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv
 
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG, PPO_RNN
-from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
+from skrl.agents.torch import ExperimentCfg
+from skrl.agents.torch.ppo import PPO, PPO_CFG, PPO_RNN
+from skrl.agents.torch.sac import SAC, SAC_CFG
 from skrl.envs.wrappers.torch.gymnasium_envs import GymnasiumWrapper
 from skrl.memories.torch import RandomMemory
-from skrl.trainers.torch import SequentialTrainer
+from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
 
 from rlmodule.skrl.torch import RLModelCfg, SharedRLModelCfg, build_model
 from rlmodule.skrl.torch.network import (
@@ -98,47 +99,51 @@ def _make_image_env(shape: Tuple[int, int, int] = (32, 32, 3), action_dim: int =
 # ---------------------------------------------------------------------------
 
 
-def _silent_experiment(cfg: dict, tmp_path) -> dict:
-    """Configure the agent to skip disk I/O and (almost) skip tensorboard writes.
+def _silent_experiment(tmp_path) -> ExperimentCfg:
+    """SKRL 2.x ``ExperimentCfg`` that suppresses disk I/O.
 
     We cannot use ``write_interval=0`` because SAC only populates
-    ``tracking_data`` when ``write_interval > 0`` (see ``SAC._update``). Instead
-    we set a very large ``write_interval`` so the condition
-    ``timestep % write_interval == 0`` never triggers, and redirect the
-    ``experiment.directory`` into a pytest ``tmp_path`` so nothing is written
-    to the user's CWD.
+    ``tracking_data`` when ``write_interval > 0`` (see
+    ``SAC._update``). Instead we use a very large ``write_interval``
+    so the modulo check ``timestep % write_interval == 0`` never
+    triggers, and we redirect ``experiment.directory`` into a
+    pytest ``tmp_path`` so any incidental writes (e.g. the
+    SummaryWriter constructor) are sandboxed.
     """
-    cfg["experiment"]["write_interval"] = 10**9
-    cfg["experiment"]["checkpoint_interval"] = 0
-    cfg["experiment"]["directory"] = str(tmp_path)
-    return cfg
+    return ExperimentCfg(
+        write_interval=10**9,
+        checkpoint_interval=0,
+        directory=str(tmp_path),
+    )
 
 
-def _ppo_cfg(tmp_path, *, rollouts: int = ROLLOUTS) -> dict:
-    cfg = PPO_DEFAULT_CONFIG.copy()
-    cfg["rollouts"] = rollouts
-    cfg["learning_epochs"] = 2
-    cfg["mini_batches"] = 2
-    cfg["learning_rate"] = 1e-3
-    return _silent_experiment(cfg, tmp_path)
+def _ppo_cfg(tmp_path, *, rollouts: int = ROLLOUTS) -> PPO_CFG:
+    return PPO_CFG(
+        rollouts=rollouts,
+        learning_epochs=2,
+        mini_batches=2,
+        learning_rate=1e-3,
+        experiment=_silent_experiment(tmp_path),
+    )
 
 
-def _sac_cfg(tmp_path) -> dict:
-    cfg = SAC_DEFAULT_CONFIG.copy()
-    cfg["learning_starts"] = 16
-    cfg["random_timesteps"] = 0
-    cfg["batch_size"] = 16
-    cfg["gradient_steps"] = 1
-    return _silent_experiment(cfg, tmp_path)
+def _sac_cfg(tmp_path) -> SAC_CFG:
+    return SAC_CFG(
+        learning_starts=16,
+        random_timesteps=0,
+        batch_size=16,
+        gradient_steps=1,
+        experiment=_silent_experiment(tmp_path),
+    )
 
 
-def _trainer_cfg(timesteps: int = TIMESTEPS) -> dict:
-    return {
-        "timesteps": timesteps,
-        "headless": True,
-        "disable_progressbar": True,
-        "close_environment_at_exit": False,
-    }
+def _trainer_cfg(timesteps: int = TIMESTEPS) -> SequentialTrainerCfg:
+    return SequentialTrainerCfg(
+        timesteps=timesteps,
+        headless=True,
+        disable_progressbar=True,
+        close_environment_at_exit=False,
+    )
 
 
 def _gaussian_head(action_space):
@@ -222,6 +227,7 @@ def test_train_ppo_shared_mlp(pendulum_env, tmp_path):
         memory=memory,
         cfg=_ppo_cfg(tmp_path),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
@@ -263,6 +269,7 @@ def test_train_ppo_separated_residual_mlp(pendulum_env, tmp_path):
         memory=memory,
         cfg=_ppo_cfg(tmp_path),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
@@ -297,6 +304,7 @@ def test_train_ppo_rnn_mlp(pendulum_env, tmp_path):
         memory=memory,
         cfg=_ppo_cfg(tmp_path),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
@@ -345,6 +353,7 @@ def test_train_sac_separated_mlp(pendulum_env, tmp_path):
         memory=memory,
         cfg=_sac_cfg(tmp_path),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
@@ -382,6 +391,7 @@ def test_train_ppo_cnn_mlp(image_env, tmp_path):
         memory=memory,
         cfg=_ppo_cfg(tmp_path),
         observation_space=image_env.observation_space,
+        state_space=None,
         action_space=image_env.action_space,
         device=image_env.device,
     )

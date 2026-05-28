@@ -307,8 +307,9 @@ def test_shared_rlmodel_cache_released_after_backward():
     states = torch.randn(N * L, HIN)
     inputs = {"states": states, "terminated": torch.zeros(N * L, dtype=torch.bool), "rnn": _rnn_inputs(model)}
 
-    actions, log_prob, _ = model(inputs, role="policy")
-    value, _, _ = model(inputs, role="value")
+    actions, outputs = model(inputs, role="policy")
+    log_prob = outputs["log_prob"]
+    value, _ = model(inputs, role="value")
     loss = actions.sum() + value.sum() + log_prob.sum()
     loss.backward()
 

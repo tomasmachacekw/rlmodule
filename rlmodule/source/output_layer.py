@@ -138,8 +138,15 @@ class GaussianLayer(OutputLayer):
         if log_prob.dim() != actions.dim():
             log_prob = log_prob.unsqueeze(-1)
 
+        # SKRL 2.x model.act contract: return ``(actions, outputs_dict)``
+        # with auxiliary tensors (``log_prob``, ``mean_actions``)
+        # nested inside the dict. Earlier (1.x) we returned a 3-tuple
+        # ``(actions, log_prob, outputs_dict)``; the new layout keeps
+        # the upstream PPO ``outputs["log_prob"]`` call site happy and
+        # avoids divergent helpers.
         outputs_dict["mean_actions"] = mean_actions
-        return actions, log_prob, outputs_dict
+        outputs_dict["log_prob"] = log_prob
+        return actions, outputs_dict
 
         ####
 
@@ -255,4 +262,8 @@ class DeterministicLayer(OutputLayer):
         if self._clip_actions:
             actions = torch.clamp(actions, min=self._clip_actions_min, max=self._clip_actions_max)
 
-        return actions, None, outputs_dict
+        # SKRL 2.x model.act contract: 2-tuple ``(actions, outputs_dict)``.
+        # The deterministic head has no ``log_prob`` so we leave it out
+        # of the dict; PPO's value head reads predicted values from the
+        # ``actions`` slot directly.
+        return actions, outputs_dict

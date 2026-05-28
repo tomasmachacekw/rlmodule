@@ -47,8 +47,8 @@ def test_build_shared_plain_mlp_backcompat():
     )
     model = build_model(cfg)
     x = torch.randn(3, 12)
-    actions, _, _ = model({"states": x}, role="policy")
-    value, _, _ = model({"states": x}, role="value")
+    actions, _ = model({"states": x}, role="policy")
+    value, _ = model({"states": x}, role="value")
     assert actions.shape == (3, 4)
     assert value.shape == (3, 1)
     # no LayerNorms anywhere
@@ -79,8 +79,9 @@ def test_build_shared_residual_trunk_with_layer_norm_heads():
     assert sum(1 for m in model.modules() if isinstance(m, nn.LayerNorm)) == 9
 
     x = torch.randn(2, 12)
-    actions, log_prob, _ = model({"states": x}, role="policy")
-    value, _, _ = model({"states": x}, role="value")
+    actions, outputs = model({"states": x}, role="policy")
+    log_prob = outputs["log_prob"]
+    value, _ = model({"states": x}, role="value")
     assert actions.shape == (2, 4)
     assert log_prob.shape == (2, 1)
     assert value.shape == (2, 1)
@@ -109,8 +110,9 @@ def test_build_separated_mlp_ln_actor_residual_critic():
     value = build_model(cfg.value)
 
     x = torch.randn(4, 8)
-    a, lp, _ = policy({"states": x})
-    v, _, _ = value({"states": x})
+    a, outputs = policy({"states": x})
+    lp = outputs["log_prob"]
+    v, _ = value({"states": x})
     assert a.shape == (4, 2)
     assert lp.shape == (4, 1)
     assert v.shape == (4, 1)
@@ -142,8 +144,9 @@ def test_build_end_to_end_backward_pass():
     )
     model = build_model(cfg)
     x = torch.randn(5, 6)
-    actions, log_prob, _ = model({"states": x}, role="policy")
-    value, _, _ = model({"states": x}, role="value")
+    actions, outputs = model({"states": x}, role="policy")
+    log_prob = outputs["log_prob"]
+    value, _ = model({"states": x}, role="value")
     # Fake PPO-ish loss
     loss = -(log_prob.mean()) + (value ** 2).mean()
     loss.backward()

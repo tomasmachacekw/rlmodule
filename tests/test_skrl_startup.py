@@ -25,12 +25,14 @@ import torch.nn as nn
 import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv
 
-from skrl.agents.torch.a2c import A2C, A2C_DEFAULT_CONFIG
-from skrl.agents.torch.ddpg import DDPG, DDPG_DEFAULT_CONFIG
-from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG, PPO_RNN
-from skrl.agents.torch.sac import SAC, SAC_DEFAULT_CONFIG
+from skrl.agents.torch import ExperimentCfg
+from skrl.agents.torch.a2c import A2C, A2C_CFG
+from skrl.agents.torch.ddpg import DDPG, DDPG_CFG
+from skrl.agents.torch.ppo import PPO, PPO_CFG, PPO_RNN
+from skrl.agents.torch.sac import SAC, SAC_CFG
 from skrl.envs.wrappers.torch.gymnasium_envs import GymnasiumWrapper
 from skrl.memories.torch import RandomMemory
+from skrl.trainers.torch import SequentialTrainerCfg
 
 from rlmodule.skrl.torch import RLModelCfg, SharedRLModelCfg, build_model
 from rlmodule.skrl.torch.network import (
@@ -108,45 +110,68 @@ def _make_image_env(shape: Tuple[int, int, int] = (32, 32, 3), action_dim: int =
 # ---------------------------------------------------------------------------
 
 
-def _silent_experiment(cfg: dict) -> dict:
-    cfg["experiment"]["write_interval"] = 0
-    cfg["experiment"]["checkpoint_interval"] = 0
-    return cfg
+def _silent_experiment() -> ExperimentCfg:
+    """SKRL 2.x ``ExperimentCfg`` that disables tensorboard/checkpoints.
+
+    SKRL 1.x used a nested dict (``cfg["experiment"]["write_interval"]``);
+    2.x replaces it with the :class:`ExperimentCfg` dataclass embedded
+    on every agent ``*_CFG``. Helper exists once so each test does not
+    repeat the same noise-suppression boilerplate.
+    """
+    return ExperimentCfg(write_interval=0, checkpoint_interval=0)
 
 
-def _ppo_cfg() -> dict:
-    cfg = PPO_DEFAULT_CONFIG.copy()
-    cfg["rollouts"] = 16
-    cfg["learning_epochs"] = 1
-    cfg["mini_batches"] = 1
-    return _silent_experiment(cfg)
+def _ppo_cfg() -> PPO_CFG:
+    return PPO_CFG(
+        rollouts=16,
+        learning_epochs=1,
+        mini_batches=1,
+        experiment=_silent_experiment(),
+    )
 
 
-def _a2c_cfg() -> dict:
-    cfg = A2C_DEFAULT_CONFIG.copy()
-    cfg["rollouts"] = 16
-    return _silent_experiment(cfg)
+def _a2c_cfg() -> A2C_CFG:
+    return A2C_CFG(rollouts=16, experiment=_silent_experiment())
 
 
-def _sac_cfg() -> dict:
-    cfg = SAC_DEFAULT_CONFIG.copy()
-    cfg["learning_starts"] = 0
-    cfg["random_timesteps"] = 0
-    return _silent_experiment(cfg)
+def _sac_cfg() -> SAC_CFG:
+    return SAC_CFG(
+        learning_starts=0,
+        random_timesteps=0,
+        experiment=_silent_experiment(),
+    )
 
 
-def _ddpg_cfg() -> dict:
-    cfg = DDPG_DEFAULT_CONFIG.copy()
-    cfg["learning_starts"] = 0
-    cfg["random_timesteps"] = 0
-    return _silent_experiment(cfg)
+def _ddpg_cfg() -> DDPG_CFG:
+    return DDPG_CFG(
+        learning_starts=0,
+        random_timesteps=0,
+        experiment=_silent_experiment(),
+    )
+
+
+# SKRL 2.x's ``Agent.init`` calls ``dataclasses.asdict(trainer_cfg)`` so
+# we must hand it a dataclass instance, not a dict.
+_SMOKE_TRAINER_CFG = SequentialTrainerCfg(timesteps=10)
 
 
 def _assert_act(agent, env, *, expected_action_dim: int) -> None:
-    """Run ``.init()`` + one ``.act()`` call and sanity-check the output."""
-    agent.init()
+    """Run ``.init()`` + one ``.act()`` call and sanity-check the output.
+
+    SKRL 2.1.0 changes:
+
+    * ``Agent.init`` now requires a dataclass ``trainer_cfg`` (it calls
+      ``dataclasses.asdict`` on it); we pass a tiny, fixed
+      :class:`SequentialTrainerCfg` so the auto write/checkpoint
+      intervals resolve without touching the filesystem.
+    * ``Agent.act`` now takes ``(observations, states, *, timestep,
+      timesteps)`` and returns a 2-tuple ``(actions, outputs_dict)``.
+      We pass ``states=None`` because the agent doesn't use a
+      separate state space in these tests.
+    """
+    agent.init(trainer_cfg=_SMOKE_TRAINER_CFG)
     states, _ = env.reset()
-    actions, _, _ = agent.act(states, timestep=0, timesteps=10)
+    actions, _ = agent.act(states, None, timestep=0, timesteps=10)
     assert isinstance(actions, torch.Tensor)
     assert actions.shape[0] == env.num_envs
     assert actions.shape[-1] == expected_action_dim
@@ -232,6 +257,7 @@ def _make_ppo_agent(env, models, *, rnn: bool = False):
         memory=memory,
         cfg=_ppo_cfg(),
         observation_space=env.observation_space,
+        state_space=None,
         action_space=env.action_space,
         device=env.device,
     )
@@ -458,6 +484,7 @@ def test_sac_separated_mlp(pendulum_env):
         memory=memory,
         cfg=_sac_cfg(),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
@@ -483,6 +510,7 @@ def test_a2c_shared_mlp(pendulum_env):
         memory=memory,
         cfg=_a2c_cfg(),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
@@ -526,6 +554,7 @@ def test_ddpg_separated_mlp(pendulum_env):
         memory=memory,
         cfg=_ddpg_cfg(),
         observation_space=pendulum_env.observation_space,
+        state_space=None,
         action_space=pendulum_env.action_space,
         device=pendulum_env.device,
     )
