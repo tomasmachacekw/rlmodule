@@ -24,8 +24,16 @@ def get_output_size(module, input_shape):
         # TODO(ll) module.num_layer * bidirectional?
         dummy_hidden = torch.zeros(module.num_layers, 1, module.hidden_size)
         return module(dummy_input, None, (dummy_hidden, dummy_hidden))[0].view(-1).shape[0]
-    else:
-        return module(dummy_input).view(-1).shape[0]
+    out = module(dummy_input)
+    # ``GraphNetwork.forward`` returns ``(features, rnn_outputs_dict)`` to
+    # mirror the RnnBase contract, even when no recurrent node is present.
+    # ``contains_rnn_module`` is structural (looks for nn.LSTM/RNN/GRU
+    # submodules) and returns ``False`` for a non-recurrent graph, so we
+    # land here. Unwrap the leading tensor so callers see a plain tensor
+    # output regardless of the module's signature.
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return out.view(-1).shape[0]
 
 
 def get_cnn_shape(space: Union[int, Sequence[int], gym.Space, gymnasium.Space]):

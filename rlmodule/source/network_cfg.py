@@ -1,10 +1,11 @@
-from typing import Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from collections.abc import Callable
-from dataclasses import MISSING
+from dataclasses import MISSING, field
 import gym
 import gymnasium
 
+import torch
 import torch.nn as nn
 
 from rlmodule import logger
@@ -16,6 +17,8 @@ from rlmodule.source.network import (
     RNN,
     CnnBackbone,
     CnnMlp,
+    CnnProprioMlp,
+    GraphNetwork,
     ResidualMlp,
     RnnBase,
     RnnMlp,
@@ -224,3 +227,155 @@ class CnnMlpCfg(NetworkCfg):
     mlp: NetworkCfg = MISSING
     """Trunk that runs on the CNN's flat feature vector. Typically an
     :class:`MlpCfg` or :class:`ResidualMlpCfg`."""
+
+
+@configclass
+class CnnProprioMlpCfg(NetworkCfg):
+    """CNN image encoder fused with vector proprioception.
+
+    The input is a single flat vector laid out as::
+
+        [proprio_dim values, H * W * C image values]
+
+    SAC-style critics may append actions after the image slice::
+
+        [proprio_dim values, H * W * C image values, action values]
+
+    This preserves the flat SKRL observation contract while giving the network a
+    first-class CNN path for pixels/depth and a direct vector path for robot
+    state.
+    """
+
+    module: type[CnnProprioMlp] = CnnProprioMlp
+
+    image_shape: Sequence[int] = MISSING
+    """Image shape in HWC order."""
+
+    proprio_dim: int = MISSING
+    """Number of leading vector/proprioception features before the image slice."""
+
+    cnn: CnnBackboneCfg = MISSING
+    """Convolutional backbone for the flat image slice."""
+
+    cnn_embedding_size: int = 256
+    """Size of the learned visual embedding used for fusion."""
+
+    cnn_embedding_activation: type[nn.Module] = nn.ELU
+    """Activation after the visual projection and LayerNorm."""
+
+    mlp: NetworkCfg = MISSING
+    """Post-fusion trunk, typically :class:`MlpCfg` with LayerNorm."""
+
+    visual_amp_dtype: Optional[torch.dtype] = torch.bfloat16
+    """Optional autocast dtype for the visual encoder forward pass.
+
+    - ``torch.bfloat16`` (default): the recommended fast path. ``bfloat16``
+      uses 2 bytes per activation - the same memory footprint as ``float16`` -
+      while keeping ``float32``'s dynamic range, so it does not overflow on
+      realistic activations the way ``float16`` does on deep residual CNNs
+      (Impala and similar). This is what every modern CUDA GPU (Ampere+) is
+      tuned for; pre-Ampere GPUs still execute it correctly, just without
+      Tensor Core acceleration.
+    - ``None``: run the visual encoder at the model's parameter dtype
+      (typically ``torch.float32``). Safest numerically, but doubles activation
+      memory vs ``bfloat16`` and is noticeably slower; reach for this only if
+      ``bfloat16`` is somehow misbehaving.
+    - ``torch.float16``: legacy behavior. **Not recommended** without an
+      ``amp.GradScaler`` and gradient/activation clipping; leaving this on
+      while training Impala-style residual CNNs is the most common cause of
+      mid-training NaN actions on this stack (intermediate activations exceed
+      ~65504, become ``inf``, then ``nan`` propagates to the policy output).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Graph network (declarative DAG of vector / recurrent / conv primitives)
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class GraphNetworkCfg(NetworkCfg):
+    """Configuration for :class:`rlmodule.source.network.GraphNetwork`.
+
+    ``GraphNetwork`` is a thin executor that runs a DAG of pre-existing
+    rlmodule primitives (MLP, ResidualMlp, LayerNorm, CNN backbone,
+    RNN/GRU/LSTM, …) plus a small set of utility nodes (observation
+    slice, projection, concat, residual add). It is the runtime
+    counterpart to the Cyberwave RL Config graph builder UI.
+
+    Every node entry is a small JSON-friendly dict:
+
+    .. code-block:: python
+
+        {
+            "id": "mlp_trunk",
+            "type": "mlp",
+            "params": {
+                "hidden_units": [256, 256, 128],
+                "activation": nn.ELU,
+                "layer_norm": False,
+                "layer_norm_position": "pre",
+            },
+            "inputs": ["obs_proprio"],
+        }
+
+    Supported ``type`` values:
+
+    - ``"observation_input"`` — declarative input node. Takes
+      ``"indices"`` (a list of int positions in the flat observation
+      tensor) and ``"dim"``. The graph slices the global flat input on
+      forward.
+    - ``"action_input"`` — same idea but slicing the appended action
+      tail for SAC critics. Requires ``"dim"``.
+    - ``"mlp"`` — wraps :class:`MlpCfg`.
+    - ``"residual_mlp"`` — wraps :class:`ResidualMlpCfg`.
+    - ``"layer_norm"`` — :class:`nn.LayerNorm` over the inferred width.
+    - ``"activation"`` — single activation; ``params["activation"]``
+      is the ``nn.Module`` subclass.
+    - ``"projection"`` — :class:`nn.Linear` to ``params["units"]``.
+    - ``"concat"`` — concatenates inputs along the last dim.
+    - ``"residual_add"`` — adds inputs of matching dim.
+    - ``"cnn_backbone"`` — wraps :class:`CnnBackboneCfg`. The matching
+      ``observation_input`` must declare the image shape via
+      ``params["image_shape"]``.
+    - ``"rnn"`` / ``"gru"`` / ``"lstm"`` — wraps :class:`RnnCfg` /
+      :class:`GruCfg` / :class:`LstmCfg`. At most one recurrent node
+      per graph; the model adapter picks up the embedded
+      :class:`RnnBaseCfg` for SKRL hidden-state sizing.
+
+    The graph **does not** materialise output layers; the runtime
+    adapter wires Gaussian / Deterministic output layers based on the
+    user's actor/value/Q head intent. ``output_node_id`` therefore
+    points at the trunk-feature node, not at a UI head node.
+    """
+
+    module: Any = GraphNetwork
+
+    nodes: Sequence[dict[str, Any]] = field(default_factory=list)
+    """Declarative node list. Order does not matter; execution order is
+    derived from edges via topological sort."""
+
+    edges: Sequence[dict[str, str]] = field(default_factory=list)
+    """List of ``{"from": <node_id>, "to": <node_id>}`` edges."""
+
+    output_node_id: str = MISSING
+    """Trunk feature node id; the graph returns this node's output."""
+
+    flat_input_size: Optional[int] = None
+    """Observation-only prefix of the flat input tensor.
+
+    When ``None`` this is derived from :attr:`input_states` via
+    :func:`get_space_size`. Note we do **not** fall back to
+    :attr:`input_size` because ``build_model`` overwrites that with
+    ``obs_dim + action_dim`` whenever :attr:`input_actions` is set —
+    using that total here would cause ``action_input`` nodes to slice
+    past the action tail.
+    """
+
+    action_input_size: Optional[int] = None
+    """Optional size of the action tail appended to the flat input.
+
+    Only meaningful when at least one ``action_input`` node is present.
+    When ``None`` this is derived from :attr:`input_actions` via
+    :func:`get_space_size`.
+    """

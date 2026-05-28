@@ -1,9 +1,10 @@
-from typing import Sequence, Union
+from typing import Any, Sequence, Union
 
 import torch
 import torch.nn as nn
 
-from rlmodule.source.utils import get_cnn_shape, get_output_size
+from rlmodule import logger
+from rlmodule.source.utils import get_cnn_shape, get_output_size, get_space_size
 
 
 LN_POSITION_PRE = "pre"
@@ -806,6 +807,661 @@ class CnnMlp(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.cnn(input))
+
+
+class CnnProprioMlp(nn.Module):
+    """CNN encoder fused with leading vector proprioception.
+
+    Input layout is ``[proprio, flattened_image]`` for actors and
+    ``[proprio, flattened_image, action]`` for SAC-style critics. This keeps the
+    environment and SKRL-facing state as one flat tensor while avoiding the
+    common mistake of treating proprioception or actions as extra image pixels.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.image_shape = get_cnn_shape(cfg.image_shape)
+        self.proprio_dim = int(cfg.proprio_dim)
+        if self.proprio_dim <= 0:
+            raise ValueError("CnnProprioMlpCfg.proprio_dim must be > 0.")
+
+        h, w, c = self.image_shape
+        self.image_flat_dim = int(h) * int(w) * int(c)
+        expected_input = self.proprio_dim + self.image_flat_dim
+        actual_input = int(getattr(cfg, "input_size", 0) or expected_input)
+        if actual_input < expected_input:
+            raise ValueError(
+                "CnnProprioMlp input_size does not match proprio/image split: "
+                f"input_size={actual_input}, proprio_dim={self.proprio_dim}, "
+                f"image_flat_dim={self.image_flat_dim}."
+            )
+        self.extra_input_dim = actual_input - expected_input
+
+        cnn_cfg = cfg.cnn.copy()
+        cnn_cfg.input_states = self.image_shape
+        cnn_cfg.input_size = self.image_flat_dim
+        self.cnn = cnn_cfg.module(cnn_cfg)
+        cnn_out_size = get_output_size(self.cnn, self.image_flat_dim)
+
+        embedding_size = int(getattr(cfg, "cnn_embedding_size", 256))
+        if embedding_size <= 0:
+            raise ValueError("CnnProprioMlpCfg.cnn_embedding_size must be > 0.")
+        activation_cls = getattr(cfg, "cnn_embedding_activation", nn.ELU)
+        self.visual_projection = nn.Sequential(
+            nn.Linear(cnn_out_size, embedding_size),
+            nn.LayerNorm(embedding_size),
+            activation_cls(),
+        )
+
+        mlp_cfg = cfg.mlp.copy()
+        mlp_cfg.input_size = self.proprio_dim + self.extra_input_dim + embedding_size
+        self.mlp = mlp_cfg.module(mlp_cfg)
+        self.hidden_size = get_output_size(self.mlp, mlp_cfg.input_size)
+
+        # Optional autocast dtype for the visual encoder forward pass. The
+        # default (``torch.bfloat16``) keeps fp16-equivalent activation memory
+        # while matching fp32's dynamic range, so deep residual CNNs do not
+        # overflow mid-training. ``None`` runs at the parameter dtype (fp32),
+        # which roughly doubles activation memory; ``torch.float16`` is the
+        # legacy unsafe path that previously caused NaN actions on Impala
+        # backbones once policy weights drifted enough for one batch's
+        # activations to exceed fp16 range.
+        self._visual_amp_dtype: torch.dtype | None = getattr(
+            cfg, "visual_amp_dtype", torch.bfloat16
+        )
+        # We log a single warning if the visual encoder ever produces a
+        # non-finite output (typically only seen with an explicit fp16 opt-in)
+        # so the user gets a clear diagnostic instead of silent NaN actions.
+        self._nonfinite_visual_warned = False
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        expected_input = self.proprio_dim + self.image_flat_dim + self.extra_input_dim
+        if input.shape[-1] != expected_input:
+            raise ValueError(
+                f"Expected last input dim {expected_input}, "
+                f"got {input.shape[-1]}."
+            )
+        proprio = input[..., : self.proprio_dim]
+        image_start = self.proprio_dim
+        image_end = image_start + self.image_flat_dim
+        image = input[..., image_start:image_end]
+        extra = input[..., image_end:]
+
+        cnn_dtype = next(self.cnn.parameters()).dtype
+        mlp_dtype = next(self.mlp.parameters()).dtype
+
+        amp_dtype = self._visual_amp_dtype
+        # autocast is only safe / useful on CUDA tensors.
+        use_autocast = amp_dtype is not None and image.is_cuda
+
+        if use_autocast and amp_dtype == torch.float16:
+            # Mirror the legacy behavior: pre-cast image to fp16 so storage
+            # matches the autocasted ops. For bf16 we leave the input at its
+            # original dtype because PyTorch autocast handles the promotion
+            # without overflow.
+            image = image.to(dtype=torch.float16)
+        else:
+            image = image.to(dtype=cnn_dtype)
+
+        if use_autocast:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
+                visual = self.visual_projection(self.cnn(image))
+        else:
+            visual = self.visual_projection(self.cnn(image))
+
+        if not self._nonfinite_visual_warned and not torch.isfinite(visual).all():
+            logger.error(
+                "[CnnProprioMlp] Non-finite values detected in visual encoder output "
+                "(amp_dtype=%s). This is typically a float16 overflow inside the CNN "
+                "or visual projection; switch CnnProprioMlpCfg.visual_amp_dtype to "
+                "None or torch.bfloat16 to fix.",
+                amp_dtype,
+            )
+            self._nonfinite_visual_warned = True
+
+        fused = torch.cat(
+            (
+                proprio.to(dtype=mlp_dtype),
+                extra.to(dtype=mlp_dtype),
+                visual.to(dtype=mlp_dtype),
+            ),
+            dim=-1,
+        )
+        return self.mlp(fused)
+
+
+class GraphNetwork(nn.Module):
+    """Declarative graph executor for rlmodule primitives.
+
+    ``GraphNetwork`` runs a DAG of pre-existing rlmodule primitives
+    (MLP, ResidualMlp, LayerNorm, CNN backbone, RNN/GRU/LSTM, …) plus
+    a small set of utility nodes (observation/action slicing,
+    projection, concat, residual add). The cfg is JSON-friendly so it
+    can be authored from the Cyberwave RL Config graph builder UI and
+    persisted to the task's ``rl_config_spec``.
+
+    Forward signature mirrors ``RnnBase`` modules so the graph can be
+    dropped into ``Shared`` / ``Separated`` RL models that expect the
+    ``(states, terminated, rnn_inputs)`` tuple. When the graph carries
+    no recurrent node the forward returns ``(features, {})`` so the
+    SKRL hidden-state plumbing stays a no-op.
+
+    See :class:`rlmodule.source.network_cfg.GraphNetworkCfg` for the
+    accepted node types and parameter shapes.
+    """
+
+    _SUPPORTED_NODE_TYPES = (
+        "observation_input",
+        "action_input",
+        "mlp",
+        "residual_mlp",
+        "layer_norm",
+        "activation",
+        "projection",
+        "concat",
+        "residual_add",
+        "cnn_backbone",
+        "rnn",
+        "gru",
+        "lstm",
+    )
+
+    def __init__(self, cfg):
+        super().__init__()
+
+        nodes_raw = list(getattr(cfg, "nodes", None) or [])
+        edges_raw = list(getattr(cfg, "edges", None) or [])
+        output_node_id = getattr(cfg, "output_node_id", None)
+        if not nodes_raw:
+            raise ValueError("GraphNetworkCfg.nodes must contain at least one node.")
+        if not output_node_id:
+            raise ValueError(
+                "GraphNetworkCfg.output_node_id must point at a non-input node."
+            )
+
+        # Resolve flat-input / action-tail sizes.
+        #
+        # ``flat_input_size`` is the size of the observation-only prefix of
+        # the flat state tensor; ``action_input_size`` is the size of the
+        # appended action tail (used by SAC-style critics where
+        # ``RLModel.forward`` concatenates ``[states, taken_actions]``).
+        # We deliberately do not fall back to ``cfg.input_size`` for
+        # ``flat_input_size`` here, because ``build_model`` overwrites
+        # ``cfg.input_size`` with ``obs_dim + action_dim`` whenever
+        # ``input_actions`` is configured. Using that total as the
+        # observation prefix would cause every ``action_input`` node to
+        # slice past the end of the tensor.
+        flat_input_size = getattr(cfg, "flat_input_size", None)
+        if not flat_input_size:
+            input_states = getattr(cfg, "input_states", None)
+            if input_states is not None:
+                derived = get_space_size(input_states)
+                if derived > 0:
+                    flat_input_size = derived
+        flat_input_size = int(flat_input_size or 0)
+
+        action_input_size = getattr(cfg, "action_input_size", None)
+        if not action_input_size:
+            input_actions = getattr(cfg, "input_actions", None)
+            if input_actions is not None:
+                derived = get_space_size(input_actions)
+                if derived > 0:
+                    action_input_size = derived
+        action_input_size = int(action_input_size or 0)
+
+        # Pre-computed per-input slice metadata (kind/mode/start/length/buffer
+        # name). Populated by ``_register_input_indices`` during build so
+        # ``_slice_input`` can avoid recomputing whether each input's index
+        # range is contiguous on every forward.
+        self._input_specs: dict[str, dict[str, Any]] = {}
+
+        # Normalise node configs.
+        self._node_specs: dict[str, dict] = {}
+        self._node_order: list[str] = []
+        for node in nodes_raw:
+            node_id = node.get("id")
+            node_type = node.get("type")
+            if not isinstance(node_id, str) or not node_id:
+                raise ValueError("Every GraphNetwork node must have a string 'id'.")
+            if node_type not in self._SUPPORTED_NODE_TYPES:
+                raise ValueError(
+                    f"GraphNetwork node {node_id!r} has unsupported type "
+                    f"{node_type!r}. Supported: {self._SUPPORTED_NODE_TYPES}."
+                )
+            if node_id in self._node_specs:
+                raise ValueError(f"GraphNetwork node id {node_id!r} is duplicated.")
+            self._node_specs[node_id] = dict(node)
+            self._node_order.append(node_id)
+
+        # Compute adjacency / fan-in for shape inference and execution.
+        self._fanin: dict[str, list[str]] = {nid: [] for nid in self._node_specs}
+        adjacency: dict[str, list[str]] = {nid: [] for nid in self._node_specs}
+        for edge in edges_raw:
+            src = edge.get("from")
+            dst = edge.get("to")
+            if src not in self._node_specs or dst not in self._node_specs:
+                raise ValueError(
+                    f"GraphNetwork edge {edge!r} references unknown node ids."
+                )
+            adjacency[src].append(dst)
+            self._fanin[dst].append(src)
+
+        # Kahn's algorithm for topological order. We run it on the whole
+        # graph (including any nodes that may end up being unreachable
+        # from ``output_node_id``) so cycle detection still catches the
+        # full structural problem before we prune.
+        indegree = {nid: len(self._fanin[nid]) for nid in self._node_specs}
+        queue = [nid for nid, deg in indegree.items() if deg == 0]
+        topo: list[str] = []
+        while queue:
+            current = queue.pop(0)
+            topo.append(current)
+            for next_id in adjacency[current]:
+                indegree[next_id] -= 1
+                if indegree[next_id] == 0:
+                    queue.append(next_id)
+        if len(topo) != len(self._node_specs):
+            raise ValueError("GraphNetwork contains a cycle.")
+
+        if output_node_id not in self._node_specs:
+            raise ValueError(
+                f"GraphNetwork.output_node_id={output_node_id!r} is not a graph node."
+            )
+        self._output_node_id: str = output_node_id
+
+        # Prune to the set of nodes that actually contribute to the
+        # output. Nodes left dangling by the UI (alternate heads, debug
+        # branches, etc.) would otherwise run on every forward and waste
+        # both compute and activation memory; restricting execution to
+        # ancestors of the output keeps the runtime predictable. Cycle
+        # detection above has already validated the full graph, so this
+        # is purely a hot-path optimisation.
+        ancestors: set[str] = set()
+        stack = [output_node_id]
+        while stack:
+            cur = stack.pop()
+            if cur in ancestors:
+                continue
+            ancestors.add(cur)
+            stack.extend(self._fanin[cur])
+        self._active_nodes: set[str] = ancestors
+
+        inactive = [nid for nid in topo if nid not in ancestors]
+        if inactive:
+            logger.info(
+                f"GraphNetwork: {len(inactive)} node(s) not connected to "
+                f"output {output_node_id!r}; they will be skipped: {inactive}"
+            )
+
+        active_topo: list[str] = [nid for nid in topo if nid in ancestors]
+
+        # Build submodules in topological order for active nodes only. We
+        # resolve each node's input dim from its inputs' inferred output
+        # dims so MLP / residual / projection nodes can be authored
+        # without manual input_size bookkeeping. Because the ancestor set
+        # is closed under ``_fanin``, every fan-in node we touch here is
+        # also active and has already been built earlier in ``active_topo``.
+        self._modules_by_id: dict[str, nn.Module] = {}
+        self._dim_by_id: dict[str, int] = {}
+        self._is_recurrent: dict[str, bool] = {nid: False for nid in self._node_specs}
+        self._recurrent_node_id: str | None = None
+        for node_id in active_topo:
+            spec = self._node_specs[node_id]
+            module, out_dim = self._build_node(
+                spec,
+                flat_input_size=flat_input_size,
+                action_input_size=action_input_size,
+            )
+            if module is not None:
+                self.add_module(_module_attr_name(node_id), module)
+                self._modules_by_id[node_id] = module
+            self._dim_by_id[node_id] = int(out_dim)
+            if spec["type"] in ("rnn", "gru", "lstm"):
+                if self._recurrent_node_id is not None:
+                    raise ValueError(
+                        "GraphNetwork supports at most one recurrent node per "
+                        "role (v1); got both "
+                        f"{self._recurrent_node_id!r} and {node_id!r}."
+                    )
+                self._recurrent_node_id = node_id
+                self._is_recurrent[node_id] = True
+
+        self._exec_order: list[str] = active_topo
+
+        # SKRL hidden-state spec; only meaningful when a recurrent
+        # node is present. We mirror :class:`RnnBase` so the rlmodule
+        # model adapter can read the same attributes for graph and
+        # block trunks.
+        if self._recurrent_node_id is not None:
+            rec_module = self._modules_by_id[self._recurrent_node_id]
+            self.num_envs = rec_module.num_envs
+            self.num_layers = rec_module.num_layers
+            self.hidden_size = rec_module.hidden_size
+            self.sequence_length = rec_module.sequence_length
+        else:
+            self.num_envs = 0
+            self.num_layers = 0
+            self.hidden_size = int(self._dim_by_id[self._output_node_id])
+            self.sequence_length = 0
+
+    @property
+    def output_dim(self) -> int:
+        return int(self._dim_by_id[self._output_node_id])
+
+    @property
+    def has_recurrent(self) -> bool:
+        return self._recurrent_node_id is not None
+
+    # -----------------------------------------------------------------
+    # build helpers
+    # -----------------------------------------------------------------
+
+    def _input_dim_for(self, node_id: str) -> int:
+        """Return the concat-equivalent input dim for ``node_id``."""
+
+        in_ids = self._fanin[node_id]
+        if not in_ids:
+            return 0
+        return int(sum(self._dim_by_id[i] for i in in_ids))
+
+    def _single_input_dim(self, node_id: str) -> int:
+        in_ids = self._fanin[node_id]
+        if len(in_ids) != 1:
+            raise ValueError(
+                f"GraphNetwork node {node_id!r} expects exactly 1 input; "
+                f"got {len(in_ids)}."
+            )
+        return int(self._dim_by_id[in_ids[0]])
+
+    def _build_node(
+        self,
+        spec: dict,
+        *,
+        flat_input_size: int,
+        action_input_size: int,
+    ):
+        from rlmodule.source.network_cfg import (  # local import to avoid cycle
+            CnnBackboneCfg,
+            GruCfg,
+            LstmCfg,
+            MlpCfg,
+            ResidualMlpCfg,
+            RnnCfg,
+        )
+
+        node_id = spec["id"]
+        params = spec.get("params") or {}
+        node_type = spec["type"]
+
+        if node_type == "observation_input":
+            indices = list(params.get("indices") or [])
+            dim = params.get("dim", len(indices))
+            if dim <= 0:
+                raise ValueError(
+                    f"GraphNetwork observation_input {node_id!r} must have dim > 0."
+                )
+            if not indices:
+                # Allow a contiguous default: take first ``dim`` features.
+                indices = list(range(int(dim)))
+            self._register_input_indices(node_id, indices, kind="observation")
+            return None, int(dim)
+
+        if node_type == "action_input":
+            dim = int(params.get("dim", action_input_size))
+            if dim <= 0:
+                raise ValueError(
+                    f"GraphNetwork action_input {node_id!r} must have dim > 0."
+                )
+            if flat_input_size <= 0:
+                # SAC-style critics receive a concatenated ``[states,
+                # taken_actions]`` tensor (see ``RLModel.forward``), so
+                # the action tail starts at ``flat_input_size``. Without
+                # that offset we would silently slice from the start of
+                # the observation tensor.
+                raise ValueError(
+                    f"GraphNetwork action_input {node_id!r}: cannot determine "
+                    "the action-tail offset because flat_input_size is "
+                    "unknown. Set GraphNetworkCfg.flat_input_size or "
+                    "GraphNetworkCfg.input_states."
+                )
+            indices = list(range(flat_input_size, flat_input_size + dim))
+            self._register_input_indices(node_id, indices, kind="action")
+            return None, dim
+
+        if node_type == "mlp":
+            in_dim = self._single_input_dim(node_id)
+            sub_cfg = MlpCfg(
+                input_size=in_dim,
+                hidden_units=list(params.get("hidden_units") or []),
+                activation=params.get("activation", nn.ELU),
+                layer_norm=params.get("layer_norm", False),
+                layer_norm_position=params.get("layer_norm_position", "pre"),
+            )
+            module = MLP(sub_cfg)
+            return module, int(sub_cfg.hidden_units[-1])
+
+        if node_type == "residual_mlp":
+            in_dim = self._single_input_dim(node_id)
+            hidden_size = int(params.get("hidden_size"))
+            sub_cfg = ResidualMlpCfg(
+                input_size=in_dim,
+                hidden_size=hidden_size,
+                num_blocks=int(params.get("num_blocks", 2)),
+                activation=params.get("activation", nn.ELU),
+                layer_norm=params.get("layer_norm", True),
+                final_layer_norm=params.get("final_layer_norm", True),
+            )
+            module = ResidualMlp(sub_cfg)
+            return module, hidden_size
+
+        if node_type == "layer_norm":
+            in_dim = self._single_input_dim(node_id)
+            return nn.LayerNorm(in_dim), in_dim
+
+        if node_type == "activation":
+            in_dim = self._single_input_dim(node_id)
+            activation_cls = params.get("activation", nn.ELU)
+            return activation_cls(), in_dim
+
+        if node_type == "projection":
+            in_dim = self._single_input_dim(node_id)
+            out_dim = int(params.get("units"))
+            return nn.Linear(in_dim, out_dim), out_dim
+
+        if node_type == "concat":
+            return None, self._input_dim_for(node_id)
+
+        if node_type == "residual_add":
+            in_ids = self._fanin[node_id]
+            if len(in_ids) != 2:
+                raise ValueError(
+                    f"GraphNetwork residual_add {node_id!r} requires exactly 2 inputs."
+                )
+            d0 = self._dim_by_id[in_ids[0]]
+            d1 = self._dim_by_id[in_ids[1]]
+            if d0 != d1:
+                raise ValueError(
+                    f"GraphNetwork residual_add {node_id!r} inputs must have "
+                    f"matching dimensions; got {d0} and {d1}."
+                )
+            return None, int(d0)
+
+        if node_type == "cnn_backbone":
+            in_dim = self._single_input_dim(node_id)
+            image_shape = params.get("image_shape")
+            if image_shape is None:
+                raise ValueError(
+                    f"GraphNetwork cnn_backbone {node_id!r} requires "
+                    "params['image_shape'] = (H, W, C)."
+                )
+            sub_cfg = CnnBackboneCfg(
+                input_size=in_dim,
+                input_states=tuple(image_shape),
+                preset=params.get("preset", "nature"),
+                impala_widths=tuple(
+                    params.get("impala_widths", (16, 32, 32))
+                ),
+            )
+            module = CnnBackbone(sub_cfg)
+            # Probe the conv stack's flat output size.
+            cnn_out = get_output_size(module, in_dim)
+            return module, int(cnn_out)
+
+        if node_type in ("rnn", "gru", "lstm"):
+            in_dim = self._single_input_dim(node_id)
+            hidden_size = int(params.get("hidden_size"))
+            num_layers = int(params.get("num_layers", 1))
+            sequence_length = int(params.get("sequence_length", 16))
+            num_envs = int(params.get("num_envs", 1))
+            if node_type == "rnn":
+                sub_cfg = RnnCfg(
+                    input_size=in_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    sequence_length=sequence_length,
+                    num_envs=num_envs,
+                )
+                module = RNN(sub_cfg)
+            elif node_type == "gru":
+                sub_cfg = GruCfg(
+                    input_size=in_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    sequence_length=sequence_length,
+                    num_envs=num_envs,
+                )
+                module = GRU(sub_cfg)
+            else:
+                sub_cfg = LstmCfg(
+                    input_size=in_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    sequence_length=sequence_length,
+                    num_envs=num_envs,
+                )
+                module = LSTM(sub_cfg)
+            return module, hidden_size
+
+        raise ValueError(f"Unsupported GraphNetwork node type: {node_type!r}")
+
+    def _register_input_indices(
+        self, node_id: str, indices: list[int], *, kind: str
+    ) -> None:
+        """Pre-compute slice metadata for an ``observation_input`` /
+        ``action_input`` node.
+
+        Contiguous arithmetic ranges (step 1) take the ``"view"`` fast
+        path in ``_slice_input``: ``Tensor.narrow`` returns a view on the
+        original observation tensor with no copy. Arbitrary index lists
+        fall back to ``index_select``, which copies into a fresh
+        contiguous output.
+
+        The view path is the common case in practice — flat
+        ``[proprio, image, action]`` layouts produce contiguous slices —
+        and avoids a per-forward copy of the (often image-sized) slice
+        on the rollout / training hot path. The non-contiguous path
+        keeps full expressivity for graphs that pick arbitrary feature
+        positions.
+        """
+        if not indices:
+            raise ValueError(
+                f"GraphNetwork input node {node_id!r} requires a non-empty "
+                "index list."
+            )
+        indices = [int(i) for i in indices]
+        contiguous = all(
+            indices[i] + 1 == indices[i + 1] for i in range(len(indices) - 1)
+        )
+        if contiguous:
+            self._input_specs[node_id] = {
+                "kind": kind,
+                "mode": "view",
+                "start": indices[0],
+                "length": len(indices),
+            }
+            return
+
+        index_tensor = torch.tensor(indices, dtype=torch.long)
+        buf_name = f"_idx_{_module_attr_name(node_id)}"
+        # Register as buffer so ``.to(device)`` propagation works without
+        # manual moves on every forward.
+        self.register_buffer(buf_name, index_tensor, persistent=False)
+        self._input_specs[node_id] = {
+            "kind": kind,
+            "mode": "gather",
+            "start": indices[0],
+            "length": len(indices),
+            "buffer_name": buf_name,
+        }
+
+    # -----------------------------------------------------------------
+    # forward
+    # -----------------------------------------------------------------
+
+    def _slice_input(self, node_id: str, observation: torch.Tensor) -> torch.Tensor:
+        spec = self._input_specs[node_id]
+        if spec["mode"] == "view":
+            return observation.narrow(-1, spec["start"], spec["length"])
+        return observation.index_select(
+            dim=-1, index=getattr(self, spec["buffer_name"])
+        )
+
+    def _gather_inputs(
+        self, node_id: str, values: dict[str, torch.Tensor]
+    ) -> list[torch.Tensor]:
+        return [values[i] for i in self._fanin[node_id]]
+
+    def forward(self, states, terminated=None, rnn_inputs=None):
+        values: dict[str, torch.Tensor] = {}
+        rnn_outputs: dict[str, Any] | None = None
+        for node_id in self._exec_order:
+            spec = self._node_specs[node_id]
+            node_type = spec["type"]
+
+            if node_type in ("observation_input", "action_input"):
+                values[node_id] = self._slice_input(node_id, states)
+                continue
+
+            if node_type == "concat":
+                inputs = self._gather_inputs(node_id, values)
+                values[node_id] = torch.cat(inputs, dim=-1)
+                continue
+
+            if node_type == "residual_add":
+                inputs = self._gather_inputs(node_id, values)
+                values[node_id] = inputs[0] + inputs[1]
+                continue
+
+            module = self._modules_by_id[node_id]
+            if node_type in ("rnn", "gru", "lstm"):
+                input_tensor = self._gather_inputs(node_id, values)[0]
+                output, info = module(input_tensor, terminated, rnn_inputs)
+                values[node_id] = output
+                rnn_outputs = info
+                continue
+
+            input_tensor = self._gather_inputs(node_id, values)[0]
+            values[node_id] = module(input_tensor)
+
+        out = values[self._output_node_id]
+        # Only emit the RNN-style ``(features, rnn_outputs)`` tuple when
+        # this graph actually carries a recurrent node — Model.forward
+        # decides whether to unpack via ``self._rnn`` (structural
+        # ``contains_rnn_module`` check), and a tuple from a
+        # non-recurrent graph would otherwise be passed straight into
+        # the output layer as if it were a feature tensor.
+        if self._recurrent_node_id is not None:
+            return out, rnn_outputs if rnn_outputs is not None else {}
+        return out
+
+
+def _module_attr_name(node_id: str) -> str:
+    """Map a graph node id into a PyTorch-safe submodule attribute name."""
+
+    safe = "".join(c if c.isalnum() or c == "_" else "_" for c in node_id)
+    if not safe or not (safe[0].isalpha() or safe[0] == "_"):
+        safe = f"node_{safe}"
+    return f"node_{safe}"
 
 
 class CNN(nn.Module):

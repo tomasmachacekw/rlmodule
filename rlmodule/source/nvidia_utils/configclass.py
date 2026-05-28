@@ -13,6 +13,11 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import MISSING, Field, dataclass, field, replace
 
+try:
+    import annotationlib
+except ImportError:  # pragma: no cover - Python < 3.14
+    annotationlib = None
+
 from .dict import class_to_dict, update_class_from_dict
 
 
@@ -205,7 +210,7 @@ def _add_annotation_types(cls):
         if base is object:
             continue
         # get base class annotations
-        ann = base.__dict__.get("__annotations__", {})
+        ann = _get_class_annotations(base)
         # directly add all annotations from base class
         hints.update(ann)
         # iterate over base class members
@@ -238,7 +243,7 @@ def _add_annotation_types(cls):
 
     # Note: Do not change this line. `cls.__dict__.get("__annotations__", {})` is different from
     #   `cls.__annotations__` because of inheritance.
-    cls.__annotations__ = cls.__dict__.get("__annotations__", {})
+    cls.__annotations__ = _get_class_annotations(cls)
     cls.__annotations__ = hints
 
 
@@ -266,7 +271,7 @@ def _process_mutable_types(cls):
     """
     # note: Need to set this up in the same order as annotations. Otherwise, it
     #   complains about missing positional arguments.
-    ann = cls.__dict__.get("__annotations__", {})
+    ann = _get_class_annotations(cls)
 
     # iterate over all class members and store them in a dictionary
     class_members = {}
@@ -366,6 +371,16 @@ def _combined_function(f1: Callable, f2: Callable) -> Callable:
 """
 Helper functions
 """
+
+
+def _get_class_annotations(cls) -> dict:
+    """Return class annotations, including Python 3.14 lazy annotations."""
+    if annotationlib is not None and "__annotate_func__" in cls.__dict__:
+        return dict(annotationlib.get_annotations(cls, format=annotationlib.Format.VALUE))
+    ann = getattr(cls, "__annotations__", None)
+    if ann is not None:
+        return dict(ann)
+    return {}
 
 
 def _skippable_class_member(key: str, value: Any, hints: dict | None = None) -> bool:
