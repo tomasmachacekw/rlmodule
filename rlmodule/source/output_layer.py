@@ -139,11 +139,9 @@ class GaussianLayer(OutputLayer):
             log_prob = log_prob.unsqueeze(-1)
 
         # SKRL 2.x model.act contract: return ``(actions, outputs_dict)``
-        # with auxiliary tensors (``log_prob``, ``mean_actions``)
-        # nested inside the dict. Earlier (1.x) we returned a 3-tuple
-        # ``(actions, log_prob, outputs_dict)``; the new layout keeps
-        # the upstream PPO ``outputs["log_prob"]`` call site happy and
-        # avoids divergent helpers.
+        # with auxiliary tensors (``log_prob``, ``mean_actions``) nested
+        # inside the dict, matching the upstream PPO ``outputs["log_prob"]``
+        # call site.
         outputs_dict["mean_actions"] = mean_actions
         outputs_dict["log_prob"] = log_prob
         return actions, outputs_dict

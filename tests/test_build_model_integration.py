@@ -16,7 +16,7 @@ from rlmodule.skrl.torch import (
     SharedRLModelCfg,
     build_model,
 )
-from rlmodule.skrl.torch.network import MlpCfg, ResidualMlpCfg
+from rlmodule.skrl.torch.network import GraphNetworkCfg, MlpCfg, ResidualMlpCfg
 from rlmodule.skrl.torch.output_layer import (
     DeterministicLayerCfg,
     GaussianLayerCfg,
@@ -156,3 +156,79 @@ def test_build_end_to_end_backward_pass():
         assert p.grad is not None, f"{name} has no grad"
         assert not torch.isnan(p.grad).any(), f"{name} grad is NaN"
         assert not torch.isinf(p.grad).any(), f"{name} grad is Inf"
+
+
+def test_build_model_with_graph_network_trunk():
+    """``build_model`` must accept a declarative ``GraphNetworkCfg`` trunk and
+    wire its inferred output width into the (Gaussian) output head."""
+
+    obs_dim = 8
+    graph = GraphNetworkCfg(
+        input_states=obs_dim,
+        nodes=[
+            {
+                "id": "obs",
+                "type": "observation_input",
+                "params": {"indices": list(range(obs_dim)), "dim": obs_dim},
+            },
+            {
+                "id": "trunk",
+                "type": "mlp",
+                "params": {"hidden_units": [32, 16], "activation": nn.ELU},
+            },
+        ],
+        edges=[{"from": "obs", "to": "trunk"}],
+        output_node_id="trunk",
+        flat_input_size=obs_dim,
+    )
+    policy = build_model(RLModelCfg(network=graph, device="cpu", output_layer=_gaussian_head(2)))
+
+    x = torch.randn(3, obs_dim)
+    actions, outputs = policy({"states": x})
+    assert actions.shape == (3, 2)
+    assert outputs["log_prob"].shape == (3, 1)
+
+
+def test_separated_actor_consumes_observations_critic_consumes_states():
+    """SKRL 2.x contract: the actor reads ``inputs["observations"]`` and the
+    value/critic reads ``inputs["states"]``. With asymmetric obs/states we can
+    prove which key each model consumes by varying one while holding the
+    other fixed.
+    """
+
+    obs_dim = 6
+    policy = build_model(
+        RLModelCfg(
+            network=MlpCfg(input_states=obs_dim, hidden_units=[16], activation=nn.ELU),
+            device="cpu",
+            output_layer=_gaussian_head(2),
+        )
+    )
+    value = build_model(
+        RLModelCfg(
+            network=MlpCfg(input_states=obs_dim, hidden_units=[16], activation=nn.ELU),
+            device="cpu",
+            output_layer=DeterministicLayerCfg(output_size=1),
+        )
+    )
+
+    obs_a = torch.randn(4, obs_dim)
+    obs_b = torch.randn(4, obs_dim)
+    st_a = torch.randn(4, obs_dim)
+    st_b = torch.randn(4, obs_dim)
+
+    # Policy: changing only ``states`` must not move the (deterministic) mean
+    # action; changing ``observations`` must.
+    _, out_obs_a = policy({"observations": obs_a, "states": st_a}, role="policy")
+    _, out_obs_a_st_b = policy({"observations": obs_a, "states": st_b}, role="policy")
+    _, out_obs_b = policy({"observations": obs_b, "states": st_a}, role="policy")
+    assert torch.allclose(out_obs_a["mean_actions"], out_obs_a_st_b["mean_actions"])
+    assert not torch.allclose(out_obs_a["mean_actions"], out_obs_b["mean_actions"])
+
+    # Value: changing only ``observations`` must not move the value; changing
+    # ``states`` must.
+    v_st_a, _ = value({"observations": obs_a, "states": st_a}, role="value")
+    v_st_a_obs_b, _ = value({"observations": obs_b, "states": st_a}, role="value")
+    v_st_b, _ = value({"observations": obs_a, "states": st_b}, role="value")
+    assert torch.allclose(v_st_a, v_st_a_obs_b)
+    assert not torch.allclose(v_st_a, v_st_b)

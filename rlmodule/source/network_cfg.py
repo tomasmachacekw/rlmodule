@@ -316,8 +316,11 @@ class GraphNetworkCfg(NetworkCfg):
                 "layer_norm": False,
                 "layer_norm_position": "pre",
             },
-            "inputs": ["obs_proprio"],
         }
+
+    Node connectivity is defined separately via ``edges`` (a list of
+    ``{"from": ..., "to": ...}`` dicts), not by an ``inputs`` field on
+    the node.
 
     Supported ``type`` values:
 

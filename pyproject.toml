@@ -1,9 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "rlmodule"
-version = "0.1.6.3"
+version = "0.1.7"
 description = "Flexible reinforcement learning models instantiators library"
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.10"
 license = {text = "MIT License"}
 authors = [
   {name = "Lopatovsky"},
@@ -20,24 +24,27 @@ classifiers = [
   "Topic :: Scientific/Engineering",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Operating System :: OS Independent",
 ]
 dependencies = [
   "gym",
   "gymnasium==0.29.0",
   "torch>=1.9",
-  "skrl>=1.3.0",
+  "skrl>=2.1",
 ]
 
 [project.optional-dependencies]
 
 # TODO(ll) only examples should depend on skrl, not the main code.
 skrl = [
-  "skrl>=1.3.0",
+  "skrl>=2.1",
 ]
 
 all = [
-  "skrl>=1.3.0",
+  "skrl>=2.1",
 ]
 
 # urls
@@ -48,6 +55,10 @@ all = [
 "Bug Reports" = "https://github.com/FabricaAI/rlmodule/issues"
 "Say Thanks!" = "https://github.com/lopatovsky"
 "Source" = "https://github.com/FabricaAI/rlmodule"
+
+[tool.setuptools.packages.find]
+include = ["rlmodule*"]
+exclude = ["tests*", "docs*"]
 
 [tool.yapf]
 # run: yapf -p -m -i -r <folder>

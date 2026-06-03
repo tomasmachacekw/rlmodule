@@ -8,6 +8,40 @@ from rlmodule import logger
 from .model import Model
 
 
+# SKRL 2.x roles whose canonical trunk input is the actor's observation. Every
+# other role (``value``, ``critic_*``, ``target_critic_*``) is a critic and
+# reads ``states``.
+_ACTOR_ROLES = frozenset({"policy", "target_policy"})
+
+
+def _select_trunk_input(inputs: Mapping[str, Union[torch.Tensor, Any]], role: str) -> torch.Tensor:
+    """Pick the trunk input tensor for ``role`` per the SKRL 2.x contract.
+
+    SKRL 2.x agents always pass both ``inputs["observations"]`` (the actor's
+    view) and ``inputs["states"]`` (the critic's view). In a symmetric setup
+    the agent sets ``state_space = observation_space`` so the two are equal;
+    they differ only for an asymmetric / central critic. Actors read
+    ``observations``; value / critic roles read ``states``.
+
+    The other key is used only as a fallback when the preferred one is absent
+    (e.g. a model invoked directly with a single key); if neither is present we
+    raise instead of silently masking the intended source.
+    """
+    if role in _ACTOR_ROLES:
+        prefer, other = "observations", "states"
+    else:
+        prefer, other = "states", "observations"
+    trunk_input = inputs.get(prefer)
+    if trunk_input is None:
+        trunk_input = inputs.get(other)
+    if trunk_input is None:
+        raise KeyError(
+            f"Model.forward expected '{prefer}' (role={role!r}) in inputs, "
+            "but neither 'observations' nor 'states' was provided."
+        )
+    return trunk_input
+
+
 class RLModel(Model):
     def __init__(
         self,
@@ -26,19 +60,15 @@ class RLModel(Model):
     ) -> Tuple[torch.Tensor, Mapping[str, Union[torch.Tensor, Any]]]:
         """Forward the trunk + output layer.
 
-        SKRL 2.x agents pass the trunk input under
-        ``inputs["observations"]`` and reserve ``inputs["states"]``
-        for asymmetric actor-critic state info (often ``None``).
-        SKRL 1.x only had ``inputs["states"]``. We accept both for
-        backwards compatibility: prefer ``"observations"`` and fall
-        back to ``"states"`` if the caller is still using the 1.x
-        naming. The result follows the 2.x 2-tuple
-        ``(actions, outputs_dict)`` contract.
+        Input selection follows the SKRL 2.x convention (see
+        :func:`_select_trunk_input`): actor roles read ``observations`` and
+        value / critic roles read ``states``. Q-functions
+        (``self._input_actions``) are critics, so they read ``states`` and
+        additionally concatenate ``taken_actions`` onto the trunk input. The
+        result follows the 2.x 2-tuple ``(actions, outputs_dict)`` contract.
         """
 
-        trunk_input = inputs.get("observations")
-        if trunk_input is None:
-            trunk_input = inputs["states"]
+        trunk_input = _select_trunk_input(inputs, role)
         if self._input_actions:
             trunk_input = torch.cat((trunk_input, inputs["taken_actions"]), dim=1)
         if self._rnn:
@@ -102,10 +132,13 @@ class SharedRLModel(Model):
     ) -> Tuple[torch.Tensor, Mapping[str, Union[torch.Tensor, Any]]]:
         """Forward the shared trunk and dispatch to a per-role head.
 
-        See :meth:`RLModel.forward` for the ``observations`` vs
-        ``states`` key contract. The shared trunk runs once per
-        unique input tensor and the cached output is dispatched to
-        the policy or value head based on ``role``.
+        The trunk is shared by the policy and value heads, so it must consume a
+        single, role-independent input. It reads ``observations`` (the actor's
+        view), which equals ``states`` in the symmetric setups a shared
+        actor-critic assumes (SKRL 2.x defaults ``state_space`` to
+        ``observation_space``). ``states`` is used only as a fallback for
+        direct invocation. The trunk runs once per unique input tensor and the
+        cached output is dispatched to the policy or value head by ``role``.
         """
 
         states = inputs.get("observations")
@@ -134,3 +167,4 @@ class SharedRLModel(Model):
             return self._policy_output_layer(output, inputs.get("taken_actions", None), output_dict)
         elif role == "value":
             return self._value_output_layer(output, inputs.get("taken_actions", None), output_dict)
+        raise ValueError(f"SharedRLModel.forward got unsupported role {role!r}; expected 'policy' or 'value'.")

@@ -692,3 +692,96 @@ def test_graph_network_input_specs_view_avoid_buffer_registration():
     assert spec["mode"] == "view"
     assert "buffer_name" not in spec
     assert "_idx_node_obs" not in dict(net.named_buffers())
+
+
+def test_graph_network_gru_forward_executes_in_rollout():
+    """Exercise the recurrent branch of the executor end-to-end.
+
+    The metadata-only test above checks ``has_recurrent`` / ``output_dim``;
+    this one actually runs the GRU forward in eval/rollout mode, feeding a
+    real hidden state and asserting the graph returns finite features plus an
+    updated ``{"rnn": [...]}`` dict shaped for SKRL's hidden-state plumbing.
+    """
+
+    obs_dim = 6
+    hidden_size = 8
+    num_layers = 1
+    num_envs = 3
+    cfg = GraphNetworkCfg(
+        nodes=[
+            {
+                "id": "obs",
+                "type": "observation_input",
+                "params": {"indices": list(range(obs_dim)), "dim": obs_dim},
+            },
+            {
+                "id": "rec",
+                "type": "gru",
+                "params": {
+                    "hidden_size": hidden_size,
+                    "num_layers": num_layers,
+                    "sequence_length": 4,
+                    "num_envs": num_envs,
+                },
+            },
+        ],
+        edges=[{"from": "obs", "to": "rec"}],
+        output_node_id="rec",
+        flat_input_size=obs_dim,
+    )
+    net = GraphNetwork(cfg).eval()
+    states = torch.randn(num_envs, obs_dim)
+    h0 = torch.zeros(num_layers, num_envs, hidden_size)
+
+    out, info = net(states, terminated=None, rnn_inputs=[h0])
+
+    assert out.shape == (num_envs, hidden_size)
+    assert torch.isfinite(out).all()
+    assert "rnn" in info
+    assert info["rnn"][0].shape == (num_layers, num_envs, hidden_size)
+
+
+def _two_node_graph(trunk_spec: dict, *, in_dim: int = 6):
+    """Build an ``observation_input -> trunk`` graph with the given trunk."""
+
+    return GraphNetworkCfg(
+        nodes=[
+            {
+                "id": "obs",
+                "type": "observation_input",
+                "params": {"indices": list(range(in_dim)), "dim": in_dim},
+            },
+            {"id": "trunk", **trunk_spec},
+        ],
+        edges=[{"from": "obs", "to": "trunk"}],
+        output_node_id="trunk",
+        flat_input_size=in_dim,
+    )
+
+
+def test_graph_network_mlp_requires_activation():
+    """A required cfg field (``activation``) must be supplied explicitly;
+    the executor refuses to invent a default."""
+
+    cfg = _two_node_graph({"type": "mlp", "params": {"hidden_units": [8]}})
+    with pytest.raises(ValueError, match="activation"):
+        GraphNetwork(cfg)
+
+
+def test_graph_network_residual_mlp_requires_hidden_size():
+    cfg = _two_node_graph(
+        {"type": "residual_mlp", "params": {"num_blocks": 2, "activation": torch.nn.ELU}}
+    )
+    with pytest.raises(ValueError, match="hidden_size"):
+        GraphNetwork(cfg)
+
+
+def test_graph_network_rnn_requires_num_envs():
+    cfg = _two_node_graph(
+        {
+            "type": "gru",
+            "params": {"hidden_size": 8, "num_layers": 1, "sequence_length": 4},
+        }
+    )
+    with pytest.raises(ValueError, match="num_envs"):
+        GraphNetwork(cfg)

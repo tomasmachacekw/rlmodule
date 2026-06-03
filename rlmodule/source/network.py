@@ -707,6 +707,44 @@ def _build_impala_cnn(in_channels: int, widths: Sequence[int] = (16, 32, 32)) ->
     return nn.Sequential(*stages)
 
 
+_NN_LAYER_REGISTRY: dict[str, type] = {
+    "Conv2d": nn.Conv2d,
+    "ELU": nn.ELU,
+    "ReLU": nn.ReLU,
+    "MaxPool2d": nn.MaxPool2d,
+    "AdaptiveAvgPool2d": nn.AdaptiveAvgPool2d,
+    "Flatten": nn.Flatten,
+    "BatchNorm2d": nn.BatchNorm2d,
+}
+
+
+def _build_nn_layers_from_spec(layers_spec: list[dict]) -> list[nn.Module]:
+    """Construct ``nn.Module`` instances from a JSON-serialisable layer list.
+
+    Each dict must contain a ``"type"`` key matching one of the registered
+    layer types. The remaining keys are forwarded as keyword arguments to
+    the constructor. Values that are lists are converted to tuples where
+    the constructor expects it (e.g. ``kernel_size``, ``output_size``).
+    """
+    modules: list[nn.Module] = []
+    for spec in layers_spec:
+        spec = dict(spec)
+        layer_type = spec.pop("type")
+        cls = _NN_LAYER_REGISTRY.get(layer_type)
+        if cls is None:
+            raise ValueError(
+                f"Unknown layer type {layer_type!r} in custom CNN spec. "
+                f"Supported: {sorted(_NN_LAYER_REGISTRY)}"
+            )
+        cleaned: dict[str, object] = {}
+        for k, v in spec.items():
+            if isinstance(v, list):
+                v = tuple(v)
+            cleaned[k] = v
+        modules.append(cls(**cleaned))
+    return modules
+
+
 class CnnBackbone(nn.Module):
     """Flat-vector CNN backbone with named presets.
 
@@ -928,6 +966,23 @@ class CnnProprioMlp(nn.Module):
             dim=-1,
         )
         return self.mlp(fused)
+
+
+def _require_graph_param(params: dict, key: str, node_id: str, node_type: str):
+    """Return a required ``GraphNetwork`` node parameter or raise.
+
+    Required parameters mirror the ``MISSING`` fields on the corresponding
+    cfg dataclasses (e.g. ``MlpCfg.hidden_units``, ``RnnBaseCfg.num_envs``).
+    Optional parameters are intentionally *not* funneled through here: they
+    are simply omitted when absent so the cfg dataclass default applies,
+    keeping each default defined in exactly one place (the cfg) instead of
+    being re-hardcoded inside the executor.
+    """
+    if key not in params or params[key] is None:
+        raise ValueError(
+            f"GraphNetwork {node_type} node {node_id!r} requires params[{key!r}]."
+        )
+    return params[key]
 
 
 class GraphNetwork(nn.Module):
@@ -1230,26 +1285,35 @@ class GraphNetwork(nn.Module):
 
         if node_type == "mlp":
             in_dim = self._single_input_dim(node_id)
+            hidden_units = list(_require_graph_param(params, "hidden_units", node_id, "mlp"))
+            if not hidden_units:
+                raise ValueError(
+                    f"GraphNetwork mlp node {node_id!r} requires a non-empty "
+                    "params['hidden_units']."
+                )
+            # Optional fields fall back to the MlpCfg dataclass defaults.
+            optional = {k: params[k] for k in ("layer_norm", "layer_norm_position") if k in params}
             sub_cfg = MlpCfg(
                 input_size=in_dim,
-                hidden_units=list(params.get("hidden_units") or []),
-                activation=params.get("activation", nn.ELU),
-                layer_norm=params.get("layer_norm", False),
-                layer_norm_position=params.get("layer_norm_position", "pre"),
+                hidden_units=hidden_units,
+                activation=_require_graph_param(params, "activation", node_id, "mlp"),
+                **optional,
             )
             module = MLP(sub_cfg)
             return module, int(sub_cfg.hidden_units[-1])
 
         if node_type == "residual_mlp":
             in_dim = self._single_input_dim(node_id)
-            hidden_size = int(params.get("hidden_size"))
+            hidden_size = int(_require_graph_param(params, "hidden_size", node_id, "residual_mlp"))
+            num_blocks = int(_require_graph_param(params, "num_blocks", node_id, "residual_mlp"))
+            # Optional fields fall back to the ResidualMlpCfg dataclass defaults.
+            optional = {k: params[k] for k in ("layer_norm", "final_layer_norm") if k in params}
             sub_cfg = ResidualMlpCfg(
                 input_size=in_dim,
                 hidden_size=hidden_size,
-                num_blocks=int(params.get("num_blocks", 2)),
-                activation=params.get("activation", nn.ELU),
-                layer_norm=params.get("layer_norm", True),
-                final_layer_norm=params.get("final_layer_norm", True),
+                num_blocks=num_blocks,
+                activation=_require_graph_param(params, "activation", node_id, "residual_mlp"),
+                **optional,
             )
             module = ResidualMlp(sub_cfg)
             return module, hidden_size
@@ -1260,12 +1324,12 @@ class GraphNetwork(nn.Module):
 
         if node_type == "activation":
             in_dim = self._single_input_dim(node_id)
-            activation_cls = params.get("activation", nn.ELU)
+            activation_cls = _require_graph_param(params, "activation", node_id, "activation")
             return activation_cls(), in_dim
 
         if node_type == "projection":
             in_dim = self._single_input_dim(node_id)
-            out_dim = int(params.get("units"))
+            out_dim = int(_require_graph_param(params, "units", node_id, "projection"))
             return nn.Linear(in_dim, out_dim), out_dim
 
         if node_type == "concat":
@@ -1294,14 +1358,29 @@ class GraphNetwork(nn.Module):
                     f"GraphNetwork cnn_backbone {node_id!r} requires "
                     "params['image_shape'] = (H, W, C)."
                 )
-            sub_cfg = CnnBackboneCfg(
-                input_size=in_dim,
-                input_states=tuple(image_shape),
-                preset=params.get("preset", "nature"),
-                impala_widths=tuple(
-                    params.get("impala_widths", (16, 32, 32))
-                ),
-            )
+            # ``preset`` / ``impala_widths`` are optional: when absent we let
+            # the CnnBackboneCfg dataclass defaults apply rather than
+            # re-hardcoding them here.
+            preset = params.get("preset")
+            custom_layers = None
+            if preset == "custom":
+                layers_spec = params.get("layers")
+                if not layers_spec:
+                    raise ValueError(
+                        f"GraphNetwork cnn_backbone {node_id!r} with "
+                        "preset='custom' requires a 'layers' list."
+                    )
+                custom_layers = _build_nn_layers_from_spec(layers_spec)
+            cfg_kwargs: dict[str, Any] = {
+                "input_size": in_dim,
+                "input_states": tuple(image_shape),
+                "layers": custom_layers,
+            }
+            if preset is not None:
+                cfg_kwargs["preset"] = preset
+            if "impala_widths" in params:
+                cfg_kwargs["impala_widths"] = tuple(params["impala_widths"])
+            sub_cfg = CnnBackboneCfg(**cfg_kwargs)
             module = CnnBackbone(sub_cfg)
             # Probe the conv stack's flat output size.
             cnn_out = get_output_size(module, in_dim)
@@ -1309,10 +1388,12 @@ class GraphNetwork(nn.Module):
 
         if node_type in ("rnn", "gru", "lstm"):
             in_dim = self._single_input_dim(node_id)
-            hidden_size = int(params.get("hidden_size"))
-            num_layers = int(params.get("num_layers", 1))
-            sequence_length = int(params.get("sequence_length", 16))
-            num_envs = int(params.get("num_envs", 1))
+            # RnnBaseCfg marks all four of these as required (MISSING), so the
+            # graph node requires them too rather than inventing silent values.
+            hidden_size = int(_require_graph_param(params, "hidden_size", node_id, node_type))
+            num_layers = int(_require_graph_param(params, "num_layers", node_id, node_type))
+            sequence_length = int(_require_graph_param(params, "sequence_length", node_id, node_type))
+            num_envs = int(_require_graph_param(params, "num_envs", node_id, node_type))
             if node_type == "rnn":
                 sub_cfg = RnnCfg(
                     input_size=in_dim,

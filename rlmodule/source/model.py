@@ -218,16 +218,14 @@ class Model(torch.nn.Module):
         """Act randomly according to the action space.
 
         Returns a 2-tuple ``(actions, outputs_dict)`` matching the
-        SKRL 2.x model.act contract; the action-space dispatch is
-        unchanged from 1.x.
+        SKRL 2.x ``model.act`` contract.
         """
 
-        # Pull the batch shape from whichever input the agent provided.
-        # 2.x agents typically pass ``observations``; older callers may
-        # still pass ``states``.
+        # SKRL 2.x agents pass the actor input under ``observations``;
+        # fall back to ``states`` when a model is invoked directly.
         anchor = inputs.get("observations")
         if anchor is None:
-            anchor = inputs.get("states")
+            anchor = inputs["states"]
         batch_size = anchor.shape[0]
 
         # discrete action space (Discrete)
@@ -389,34 +387,15 @@ class Model(torch.nn.Module):
         """
         return self.forward(inputs, role)
 
-    def set_mode(self, mode: str) -> None:
-        """Set the model mode (training or evaluation).
-
-        Legacy 1.x-style accessor; SKRL 2.x agents call
-        :meth:`enable_training_mode` instead.
-
-        :param mode: Mode: ``"train"`` for training or ``"eval"`` for
-            evaluation. See :py:meth:`torch.nn.Module.train` for
-            details.
-
-        :raises ValueError: If the mode is not ``"train"`` or
-            ``"eval"``.
-        """
-        if mode == "train":
-            self.train(True)
-        elif mode == "eval":
-            self.train(False)
-        else:
-            raise ValueError("Invalid mode. Use 'train' for training or 'eval' for evaluation")
-
     def enable_training_mode(self, enabled: bool = True) -> None:
-        """SKRL 2.x compatibility shim that mirrors :meth:`set_mode`.
+        """Enable or disable training mode.
 
-        SKRL 1.x called ``model.set_mode("train" | "eval")``; SKRL 2.x
-        instead calls ``model.enable_training_mode(True | False)`` from
-        ``Agent.enable_models_training_mode``. Keeping both methods
-        lets the same ``Model`` subclass work against either skrl
-        major version without divergent caller code.
+        SKRL 2.x agents call this from
+        ``Agent.enable_models_training_mode`` to toggle the underlying
+        :py:meth:`torch.nn.Module.train` flag.
+
+        :param enabled: Set training mode if ``True``, evaluation mode if
+            ``False`` (default: ``True``).
         """
 
         self.train(enabled)
