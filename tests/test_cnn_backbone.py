@@ -309,3 +309,91 @@ def test_visual_amp_dtype_fp16_logs_warning_on_nonfinite_output():
     assert net._nonfinite_visual_warned is True
     _ = net(x)
     assert net._nonfinite_visual_warned is True
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveMaxPool2d / SpatialSoftmax custom layers
+# ---------------------------------------------------------------------------
+
+
+def test_spatial_softmax_finds_a_single_hot_pixel():
+    from rlmodule.source.network import SpatialSoftmax
+
+    layer = SpatialSoftmax(temperature=0.01, learnable_temperature=False)
+    x = torch.zeros(2, 3, 5, 9)
+    x[0, 0, 0, 0] = 10.0  # top-left
+    x[0, 1, 4, 8] = 10.0  # bottom-right
+    x[0, 2, 2, 4] = 10.0  # centre
+    x[1, 0, 1, 6] = 10.0  # row 1 of 5 -> y -0.5; column 6 of 9 -> x 0.5
+    out = layer(x)
+    assert out.shape == (2, 6)
+    torch.testing.assert_close(out[0], torch.tensor([-1.0, -1.0, 1.0, 1.0, 0.0, 0.0]), atol=1e-4, rtol=0)
+    torch.testing.assert_close(out[1, :2], torch.tensor([0.5, -0.5]), atol=1e-4, rtol=0)
+    # A flat map spreads the attention uniformly: the keypoint is the centre.
+    torch.testing.assert_close(out[1, 2:], torch.zeros(4), atol=1e-6, rtol=0)
+
+
+def test_spatial_softmax_temperature_is_trainable_and_positive():
+    from rlmodule.source.network import SpatialSoftmax
+
+    layer = SpatialSoftmax(temperature=0.5)
+    assert float(layer.log_temperature.detach().exp()) == pytest.approx(0.5)
+    x = torch.randn(4, 2, 6, 6, requires_grad=True)
+    layer(x).pow(2).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert layer.log_temperature.grad is not None
+    fixed = SpatialSoftmax(learnable_temperature=False)
+    assert not list(fixed.parameters())
+    with pytest.raises(ValueError):
+        SpatialSoftmax(temperature=0.0)
+
+
+def test_spatial_softmax_keeps_the_input_dtype():
+    from rlmodule.source.network import SpatialSoftmax
+
+    out = SpatialSoftmax()(torch.randn(2, 3, 4, 4, dtype=torch.bfloat16))
+    assert out.dtype == torch.bfloat16
+
+
+def test_adaptive_max_pool_keeps_a_small_peak_that_avg_pool_dilutes():
+    from rlmodule.source.network import _build_nn_layers_from_spec
+
+    mx, = _build_nn_layers_from_spec([{"type": "AdaptiveMaxPool2d", "output_size": [2, 2]}])
+    av, = _build_nn_layers_from_spec([{"type": "AdaptiveAvgPool2d", "output_size": [2, 2]}])
+    x = torch.zeros(1, 1, 8, 8)
+    x[0, 0, 1, 1] = 1.0
+    assert float(mx(x)[0, 0, 0, 0]) == 1.0
+    assert float(av(x)[0, 0, 0, 0]) == pytest.approx(1 / 16)
+
+
+def test_cnn_backbone_custom_spec_with_spatial_softmax_and_max_pool_branches():
+    """Two branches over one 32x48 depth image, as a GraphNetwork builds them."""
+    from rlmodule.source.network import GraphNetwork
+    from rlmodule.source.network_cfg import GraphNetworkCfg
+
+    h, w = 32, 48
+    conv = {"type": "Conv2d", "in_channels": 1, "out_channels": 8, "kernel_size": 3, "padding": 1}
+    cfg = GraphNetworkCfg(
+        nodes=[
+            {"id": "img", "type": "observation_input",
+             "params": {"indices": list(range(h * w)), "dim": h * w, "shape": [h, w, 1], "modality": "image"}},
+            {"id": "keypoints", "type": "cnn_backbone",
+             "params": {"preset": "custom", "image_shape": [h, w, 1],
+                        "layers": [conv, {"type": "ELU"}, {"type": "SpatialSoftmax", "temperature": 1.0}]}},
+            {"id": "maxpool", "type": "cnn_backbone",
+             "params": {"preset": "custom", "image_shape": [h, w, 1],
+                        "layers": [conv, {"type": "ELU"}, {"type": "AdaptiveMaxPool2d", "output_size": [4, 6]},
+                                   {"type": "Flatten"}]}},
+            {"id": "cat", "type": "concat", "params": {}},
+        ],
+        edges=[{"from": "img", "to": "keypoints"}, {"from": "img", "to": "maxpool"},
+               {"from": "keypoints", "to": "cat"}, {"from": "maxpool", "to": "cat"}],
+        output_node_id="cat",
+        flat_input_size=h * w,
+    )
+    net = GraphNetwork(cfg)
+    out = net(torch.rand(3, h * w))
+    out = out[0] if isinstance(out, tuple) else out
+    assert out.shape == (3, 8 * 2 + 8 * 4 * 6)
+    assert torch.isfinite(out).all()
+    assert out[:, :16].abs().max() <= 1.0

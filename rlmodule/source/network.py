@@ -711,12 +711,59 @@ def _build_impala_cnn(in_channels: int, widths: Sequence[int] = (16, 32, 32)) ->
     return nn.Sequential(*stages)
 
 
+class SpatialSoftmax(nn.Module):
+    """Spatial soft-argmax keypoints (Levine et al. 2016, "End-to-End Training of
+    Deep Visuomotor Policies").
+
+    For a ``(B, C, H, W)`` feature map, each channel is turned into a softmax
+    distribution over its ``H * W`` positions and reduced to that distribution's
+    expected image coordinates. The output is ``(B, 2 * C)``, flat:
+    ``[x_0, y_0, x_1, y_1, ...]``, with ``x`` (columns) and ``y`` (rows) in
+    ``[-1, 1]`` (pixel centres, -1 = left / top). It gives *where* a feature is,
+    which average pooling blurs away for features only a few pixels wide.
+
+    ``temperature`` divides the logits (lower = sharper, closer to a hard
+    argmax). With ``learnable_temperature`` it is one trained scalar, stored as
+    its log so it stays positive. The reduction runs in float32 whatever the
+    input dtype, since a bf16 softmax over hundreds of positions loses the
+    sub-pixel precision the keypoints are for.
+    """
+
+    def __init__(self, temperature: float = 1.0, learnable_temperature: bool = True):
+        super().__init__()
+        if temperature <= 0:
+            raise ValueError(f"SpatialSoftmax temperature must be > 0; got {temperature!r}.")
+        log_t = torch.tensor(float(temperature)).log()
+        if learnable_temperature:
+            self.log_temperature = nn.Parameter(log_t)
+        else:
+            self.register_buffer("log_temperature", log_t)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"SpatialSoftmax expects (B, C, H, W); got shape {tuple(x.shape)}.")
+        b, c, h, w = x.shape
+        logits = x.float().reshape(b, c, h * w) / self.log_temperature.float().exp()
+        attention = torch.softmax(logits, dim=-1)
+        ys = torch.linspace(-1.0, 1.0, h, device=x.device) if h > 1 else torch.zeros(1, device=x.device)
+        xs = torch.linspace(-1.0, 1.0, w, device=x.device) if w > 1 else torch.zeros(1, device=x.device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        ex = (attention * grid_x.reshape(1, 1, -1)).sum(-1)
+        ey = (attention * grid_y.reshape(1, 1, -1)).sum(-1)
+        return torch.stack([ex, ey], dim=-1).reshape(b, 2 * c).to(x.dtype)
+
+
 _NN_LAYER_REGISTRY: dict[str, type] = {
     "Conv2d": nn.Conv2d,
     "ELU": nn.ELU,
     "ReLU": nn.ReLU,
     "MaxPool2d": nn.MaxPool2d,
     "AdaptiveAvgPool2d": nn.AdaptiveAvgPool2d,
+    # Keeps a small, strong response (a box a few pixels wide) that average
+    # pooling would dilute with its neighbourhood.
+    "AdaptiveMaxPool2d": nn.AdaptiveMaxPool2d,
+    # Per-channel expected (x, y) keypoints; its output is already flat.
+    "SpatialSoftmax": SpatialSoftmax,
     "Flatten": nn.Flatten,
     "BatchNorm2d": nn.BatchNorm2d,
 }
