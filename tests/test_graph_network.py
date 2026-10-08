@@ -309,6 +309,75 @@ def test_graph_network_cnn_backbone_accepts_image_slice():
     assert torch.isfinite(out).all()
 
 
+def test_graph_network_cnn3d_backbone_accepts_volume_slice():
+    d, h, w, c = 5, 5, 5, 1
+    obs_dim = d * h * w * c
+    cfg = GraphNetworkCfg(
+        nodes=[
+            {
+                "id": "obs",
+                "type": "observation_input",
+                "params": {
+                    "indices": list(range(obs_dim)),
+                    "dim": obs_dim,
+                    "shape": [d, h, w, c],
+                    "modality": "volume",
+                },
+            },
+            {
+                "id": "cnn3d",
+                "type": "cnn3d_backbone",
+                "params": {
+                    "volume_shape": [d, h, w, c],
+                    "layers": [
+                        {"type": "Conv3d", "in_channels": 1, "out_channels": 8,
+                         "kernel_size": 3, "padding": 1},
+                        {"type": "ELU"},
+                        {"type": "AdaptiveAvgPool3d", "output_size": [2, 2, 2]},
+                        {"type": "Flatten"},
+                    ],
+                },
+            },
+        ],
+        edges=[{"from": "obs", "to": "cnn3d"}],
+        output_node_id="cnn3d",
+        flat_input_size=obs_dim,
+    )
+    net = GraphNetwork(cfg)
+    # 8 channels * 2*2*2 = 64 features.
+    assert net.output_dim == 64
+    flat = torch.randn(2, obs_dim)
+    out, _ = _run_forward(net, flat)
+    assert out.shape == (2, 64)
+    assert torch.isfinite(out).all()
+
+
+def test_graph_network_cnn3d_backbone_requires_4d_volume_shape():
+    obs_dim = 25
+    cfg = GraphNetworkCfg(
+        nodes=[
+            {
+                "id": "obs",
+                "type": "observation_input",
+                "params": {"indices": list(range(obs_dim)), "dim": obs_dim},
+            },
+            {
+                "id": "cnn3d",
+                "type": "cnn3d_backbone",
+                "params": {
+                    "volume_shape": [5, 5, 1],  # only 3 dims -> invalid
+                    "layers": [{"type": "Flatten"}],
+                },
+            },
+        ],
+        edges=[{"from": "obs", "to": "cnn3d"}],
+        output_node_id="cnn3d",
+        flat_input_size=obs_dim,
+    )
+    with pytest.raises(ValueError, match="4 dims"):
+        GraphNetwork(cfg)
+
+
 def test_graph_network_output_dim_is_exposed_after_construction():
     cfg = GraphNetworkCfg(
         nodes=[

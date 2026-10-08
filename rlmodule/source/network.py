@@ -766,6 +766,11 @@ _NN_LAYER_REGISTRY: dict[str, type] = {
     "SpatialSoftmax": SpatialSoftmax,
     "Flatten": nn.Flatten,
     "BatchNorm2d": nn.BatchNorm2d,
+    # 3D variants for volumetric (e.g. occupancy-grid) backbones.
+    "Conv3d": nn.Conv3d,
+    "MaxPool3d": nn.MaxPool3d,
+    "AdaptiveAvgPool3d": nn.AdaptiveAvgPool3d,
+    "BatchNorm3d": nn.BatchNorm3d,
 }
 
 
@@ -844,6 +849,66 @@ class CnnBackbone(nn.Module):
         # Reshape a flat (B, H*W*C) input to (B, C, H, W). HWC->CHW permute mirrors
         # the experimental CNN's convention.
         x = input.view(-1, *self._input_shape).permute(0, 3, 1, 2).contiguous()
+        return self.cnn(x)
+
+
+class Cnn3dBackbone(nn.Module):
+    """Flat-vector **3D** CNN backbone (the volumetric analogue of :class:`CnnBackbone`).
+
+    Accepts a flat ``(B, D*H*W*C)`` observation, reshapes it internally to
+    ``(B, C, D, H, W)`` (using the DHWC-ordered ``input_states`` shape — same
+    channels-last convention as :class:`CnnBackbone`, extended by a leading
+    depth axis), runs the chosen ``Conv3d`` stack, and returns a flat feature
+    vector suitable for an MLP head.
+
+    Unlike the 2D backbone there are no canned ``nature`` / ``impala`` presets
+    (those reference 2D image architectures), so only ``preset="custom"`` is
+    supported: build the conv stack from an explicit ``cfg.layers`` sequence
+    (e.g. ``Conv3d``/``MaxPool3d``/``AdaptiveAvgPool3d``/``Flatten``).
+
+    This mirrors the flat-vector contract of :class:`CnnBackbone` exactly, so it
+    drops straight into ``SharedRLModel`` / ``SeparatedRLModel`` with no
+    SKRL-side changes. It is the right primitive for occupancy grids and other
+    small volumetric observations, where treating the grid as a stack of 2D
+    channels would discard 3D locality.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self._input_shape = get_cnn_shape(cfg.input_states)  # (D, H, W, C)
+        if len(self._input_shape) != 4:
+            raise ValueError(
+                "Cnn3dBackboneCfg.input_states must be a 4-tuple in DHWC order "
+                f"(D, H, W, C); got {self._input_shape!r}."
+            )
+        d, h, w, c = self._input_shape
+        self._flat_size = int(d) * int(h) * int(w) * int(c)
+
+        preset = getattr(cfg, "preset", "custom")
+        if preset == "custom":
+            if cfg.layers is None or len(cfg.layers) == 0:
+                raise ValueError(
+                    "Cnn3dBackboneCfg.preset='custom' requires an explicit 'layers' sequence."
+                )
+            self.cnn = nn.Sequential(*list(cfg.layers))
+        else:
+            raise ValueError(
+                f"Unknown 3D CNN preset {preset!r}; only 'custom' is supported "
+                "(2D 'nature'/'impala' presets do not apply to volumetric input)."
+            )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Reshape a flat (B, D*H*W*C) input to (B, C, D, H, W). DHWC->CDHW permute
+        # mirrors the 2D backbone's HWC->CHW convention. Validate the flat size up
+        # front so a layout/offset mismatch fails with a clear message instead of
+        # an opaque ``.view()`` "shape is invalid for input of size" error.
+        if input.shape[-1] != self._flat_size:
+            raise ValueError(
+                f"Cnn3dBackbone expected a flat input of size {self._flat_size} "
+                f"(D*H*W*C for input_states={self._input_shape}), got "
+                f"{input.shape[-1]}."
+            )
+        x = input.view(-1, *self._input_shape).permute(0, 4, 1, 2, 3).contiguous()
         return self.cnn(x)
 
 
@@ -1067,6 +1132,7 @@ class GraphNetwork(nn.Module):
         "concat",
         "residual_add",
         "cnn_backbone",
+        "cnn3d_backbone",
         "rnn",
         "gru",
         "lstm",
@@ -1287,6 +1353,7 @@ class GraphNetwork(nn.Module):
         action_input_size: int,
     ):
         from rlmodule.source.network_cfg import (  # local import to avoid cycle
+            Cnn3dBackboneCfg,
             CnnBackboneCfg,
             GruCfg,
             LstmCfg,
@@ -1433,6 +1500,43 @@ class GraphNetwork(nn.Module):
                 cfg_kwargs["impala_widths"] = tuple(params["impala_widths"])
             sub_cfg = CnnBackboneCfg(**cfg_kwargs)
             module = CnnBackbone(sub_cfg)
+            # Probe the conv stack's flat output size.
+            cnn_out = get_output_size(module, in_dim)
+            return module, int(cnn_out)
+
+        if node_type == "cnn3d_backbone":
+            in_dim = self._single_input_dim(node_id)
+            # Accept either ``volume_shape`` or ``image_shape`` for symmetry with
+            # the 2D node; both must be a 4-dim DHWC tuple ``(D, H, W, C)``.
+            volume_shape = params.get("volume_shape")
+            if volume_shape is None:
+                volume_shape = params.get("image_shape")
+            if volume_shape is None:
+                raise ValueError(
+                    f"GraphNetwork cnn3d_backbone {node_id!r} requires "
+                    "params['volume_shape'] = (D, H, W, C)."
+                )
+            volume_shape = tuple(volume_shape)
+            if len(volume_shape) != 4:
+                raise ValueError(
+                    f"GraphNetwork cnn3d_backbone {node_id!r} volume_shape must "
+                    f"have 4 dims (D, H, W, C); got {volume_shape!r}."
+                )
+            # 3D backbone only supports the 'custom' preset; require explicit layers.
+            layers_spec = params.get("layers")
+            if not layers_spec:
+                raise ValueError(
+                    f"GraphNetwork cnn3d_backbone {node_id!r} requires a 'layers' list "
+                    "(only the 'custom' preset is supported for 3D)."
+                )
+            custom_layers = _build_nn_layers_from_spec(layers_spec)
+            sub_cfg = Cnn3dBackboneCfg(
+                input_size=in_dim,
+                input_states=volume_shape,
+                preset="custom",
+                layers=custom_layers,
+            )
+            module = Cnn3dBackbone(sub_cfg)
             # Probe the conv stack's flat output size.
             cnn_out = get_output_size(module, in_dim)
             return module, int(cnn_out)

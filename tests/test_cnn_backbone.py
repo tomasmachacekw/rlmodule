@@ -11,8 +11,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from rlmodule.source.network import CnnBackbone, CnnMlp, CnnProprioMlp
+from rlmodule.source.network import Cnn3dBackbone, CnnBackbone, CnnMlp, CnnProprioMlp
 from rlmodule.source.network_cfg import (
+    Cnn3dBackboneCfg,
     CnnBackboneCfg,
     CnnMlpCfg,
     CnnProprioMlpCfg,
@@ -56,6 +57,121 @@ def test_cnn_backbone_custom_preset_uses_user_layers():
     flat = torch.randn(2, 13 * 13 * 1)
     out = net(flat)
     assert out.shape[0] == 2 and out.dim() == 2
+
+
+# ---------------------------------------------------------------------------
+# Cnn3dBackbone (volumetric / occupancy-grid CNN, flat-vector contract)
+# ---------------------------------------------------------------------------
+
+
+def _occ_3d_layers():
+    """A small Conv3d stack that flattens to a fixed-size embedding regardless of
+    the (possibly anisotropic) input volume dims."""
+    return [
+        nn.Conv3d(1, 8, kernel_size=3, padding=1),
+        nn.ELU(),
+        nn.MaxPool3d(kernel_size=2, ceil_mode=True),
+        nn.Conv3d(8, 16, kernel_size=3, padding=1),
+        nn.ELU(),
+        nn.AdaptiveAvgPool3d((2, 2, 2)),
+        nn.Flatten(),
+    ]
+
+
+@pytest.mark.parametrize("volume", [(5, 5, 5, 1), (8, 8, 4, 1), (6, 4, 3, 1)])
+def test_cnn3d_backbone_custom_forward(volume):
+    cfg = Cnn3dBackboneCfg(input_states=volume, preset="custom", layers=_occ_3d_layers())
+    net = Cnn3dBackbone(cfg)
+    d, h, w, c = volume
+    flat = torch.randn(3, d * h * w * c)
+    out = net(flat)
+    assert out.dim() == 2
+    assert out.shape[0] == 3
+    # AdaptiveAvgPool3d((2,2,2)) over 16 channels -> 16*2*2*2 = 128 features.
+    assert out.shape[1] == 128
+
+
+def test_cnn3d_backbone_custom_preset_requires_layers():
+    with pytest.raises(ValueError):
+        Cnn3dBackbone(Cnn3dBackboneCfg(input_states=(5, 5, 5, 1), preset="custom"))
+
+
+def test_cnn3d_backbone_rejects_2d_presets():
+    for preset in ("nature", "impala", "does-not-exist"):
+        with pytest.raises(ValueError):
+            Cnn3dBackbone(
+                Cnn3dBackboneCfg(
+                    input_states=(5, 5, 5, 1), preset=preset, layers=_occ_3d_layers()
+                )
+            )
+
+
+def test_cnn3d_backbone_rejects_wrong_flat_size():
+    cfg = Cnn3dBackboneCfg(input_states=(5, 5, 5, 1), preset="custom", layers=_occ_3d_layers())
+    net = Cnn3dBackbone(cfg)
+    bad = torch.randn(2, 5 * 5 * 5 * 1 + 7)  # off-by-7 flat slice
+    with pytest.raises(ValueError, match="expected a flat input of size 125"):
+        net(bad)
+
+
+def test_cnn3d_backbone_requires_4d_input_states():
+    with pytest.raises(ValueError, match="4-tuple in DHWC"):
+        Cnn3dBackbone(
+            Cnn3dBackboneCfg(input_states=(5, 5, 1), preset="custom", layers=_occ_3d_layers())
+        )
+
+
+def test_cnn3d_backbone_dhwc_reshape_is_correct():
+    """A flat DHWC vector must map to (B, C, D, H, W) so 3D locality is preserved.
+
+    We use an identity-ish Conv3d (Flatten only) and check the permutation maps
+    the right elements: element at flat index for (d, h, w) with C=1 must land at
+    spatial position (d, h, w) of the volume the conv sees.
+    """
+    d, h, w, c = 2, 3, 4, 1
+    net = Cnn3dBackbone(
+        Cnn3dBackboneCfg(
+            input_states=(d, h, w, c),
+            preset="custom",
+            # AvgPool over the H,W plane per depth slice so each output element is
+            # the mean of one (h,w) plane -> lets us verify the depth axis ordering.
+            layers=[nn.AdaptiveAvgPool3d((d, 1, 1)), nn.Flatten()],
+        )
+    )
+    # Build a volume where every voxel in depth-slice k has value k.
+    vol = torch.zeros(1, d, h, w, c)
+    for k in range(d):
+        vol[:, k] = float(k)
+    flat = vol.reshape(1, -1)
+    out = net(flat)  # shape (1, d)
+    assert out.shape == (1, d)
+    assert torch.allclose(out[0], torch.arange(d, dtype=torch.float32))
+
+
+def test_cnn3d_backbone_backward_reaches_input_and_params():
+    torch.manual_seed(0)
+    volume = (5, 5, 5, 1)
+    cfg = Cnn3dBackboneCfg(input_states=volume, preset="custom", layers=_occ_3d_layers())
+    net = Cnn3dBackbone(cfg)
+    d, h, w, c = volume
+    flat = torch.randn(2, d * h * w * c, requires_grad=True)
+    out = net(flat)
+    out.sum().backward()
+
+    assert flat.grad is not None
+    assert torch.isfinite(flat.grad).all()
+    conv_params = [
+        (name, p) for name, p in net.named_parameters() if isinstance_conv3d_param(name)
+    ]
+    assert conv_params, "expected Conv3d parameters in the backbone"
+    for name, p in net.named_parameters():
+        assert p.grad is not None, f"{name} has no grad"
+        assert torch.isfinite(p.grad).all()
+
+
+def isinstance_conv3d_param(name: str) -> bool:
+    # Conv3d submodules live at indices 0 and 3 of the sequential stack here.
+    return name.startswith("cnn.0.") or name.startswith("cnn.3.")
 
 
 def test_cnn_mlp_with_layer_norm_trunk():

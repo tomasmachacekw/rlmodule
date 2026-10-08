@@ -160,6 +160,36 @@ spaces, Dict obs, image-aware preprocessors) is tracked separately and
 includes the `ImageRunningStandardScaler` / `PixelScaler` shipped in
 `cyberwave-rl/source/skrl` alongside this change.
 
+### Volumetric (3D) backbone
+
+For volumetric observations (e.g. occupancy grids) there is a 3D analogue,
+:class:`rlmodule.source.network_cfg.Cnn3dBackboneCfg`
+(+ :class:`rlmodule.source.network.Cnn3dBackbone`). It follows the same
+flat-vector contract as the 2D backbone but expects a **DHWC**-ordered
+`input_states` (`(D, H, W, C)`) and reshapes the flat slice to
+`(B, C, D, H, W)` before running a `Conv3d` stack. Only `preset="custom"` is
+supported (the 2D `"nature"` / `"impala"` presets have no 3D counterpart), so an
+explicit `layers` sequence is required. `GraphNetwork` exposes it via a
+`cnn3d_backbone` node whose `params["volume_shape"]` is the 4-dim DHWC tuple and
+whose `params["layers"]` is a JSON layer spec (`Conv3d` / `MaxPool3d` /
+`AdaptiveAvgPool3d` / `BatchNorm3d` / `Flatten` are registered).
+
+```python
+from rlmodule.skrl.torch.network import Cnn3dBackboneCfg
+import torch.nn as nn
+
+Cnn3dBackboneCfg(
+    input_states=(5, 5, 5, 1),           # DHWC volumetric grid
+    preset="custom",
+    layers=[
+        nn.Conv3d(1, 16, kernel_size=3, padding=1), nn.ELU(),
+        nn.MaxPool3d(kernel_size=2, ceil_mode=True),
+        nn.Conv3d(16, 32, kernel_size=3, padding=1), nn.ELU(),
+        nn.AdaptiveAvgPool3d((2, 2, 2)), nn.Flatten(),
+    ],
+)
+```
+
 ## Unit tests
 
 See `tests/test_mlp_layer_norm.py`, `tests/test_residual_mlp.py`,

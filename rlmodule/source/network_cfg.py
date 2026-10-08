@@ -15,6 +15,7 @@ from rlmodule.source.network import (
     LSTM,
     MLP,
     RNN,
+    Cnn3dBackbone,
     CnnBackbone,
     CnnMlp,
     CnnProprioMlp,
@@ -201,6 +202,31 @@ class CnnBackboneCfg(NetworkCfg):
 
     impala_widths: Sequence[int] = (16, 32, 32)
     """Per-stage channel widths for the IMPALA preset."""
+
+
+@configclass
+class Cnn3dBackboneCfg(NetworkCfg):
+    """Configuration for :class:`rlmodule.source.network.Cnn3dBackbone`.
+
+    The volumetric analogue of :class:`CnnBackboneCfg`. ``input_states`` must be
+    a **DHWC**-ordered shape (``(D, H, W, C)``): a leading depth axis prepended
+    to the 2D backbone's HWC convention. Internally the module reshapes the flat
+    observation to ``(B, C, D, H, W)``, runs the ``Conv3d`` stack, and returns a
+    flat feature vector suitable for an MLP head.
+
+    Only ``preset="custom"`` is supported (the 2D ``"nature"`` / ``"impala"``
+    presets reference image architectures that have no 3D counterpart here), so
+    ``layers`` must be provided — e.g. a stack of ``Conv3d`` / ``MaxPool3d`` /
+    ``AdaptiveAvgPool3d`` / ``Flatten`` modules.
+    """
+
+    module: type[Cnn3dBackbone] = Cnn3dBackbone
+
+    preset: str = "custom"
+    """Backbone preset. Only ``"custom"`` is supported for 3D."""
+
+    layers: Sequence[nn.Module] = None
+    """Explicit ``Conv3d`` layer stack; required for ``preset="custom"``."""
 
 
 @configclass

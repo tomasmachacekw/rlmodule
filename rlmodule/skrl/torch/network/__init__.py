@@ -9,6 +9,7 @@ __all__ = [
     "RnnMlpWithForwardedInput",
     "ResidualMlp",
     "CnnBackbone",
+    "Cnn3dBackbone",
     "CnnMlp",
     "CnnProprioMlp",
     "GraphNetwork",
@@ -23,6 +24,7 @@ __all__ = [
     "RnnMlpCfg",
     "CnnCfg",
     "CnnBackboneCfg",
+    "Cnn3dBackboneCfg",
     "CnnMlpCfg",
     "CnnProprioMlpCfg",
     "GraphNetworkCfg",
@@ -33,6 +35,7 @@ from rlmodule.source.network import (  # noqa: F401
     LSTM,
     MLP,
     RNN,
+    Cnn3dBackbone,
     CnnBackbone,
     CnnMlp,
     CnnProprioMlp,
@@ -43,6 +46,7 @@ from rlmodule.source.network import (  # noqa: F401
     RnnMlpWithForwardedInput,
 )
 from rlmodule.source.network_cfg import (  # noqa: F401
+    Cnn3dBackboneCfg,
     CnnBackboneCfg,
     CnnCfg,
     CnnMlpCfg,
