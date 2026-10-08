@@ -1,11 +1,14 @@
 from typing import Any, Mapping, Optional, Tuple, Union
 
+import logging
+
 import torch
 import torch.nn as nn
 
-from rlmodule import logger
-
 from .model import Model
+
+
+logger = logging.getLogger("rlmodule")
 
 
 # SKRL 2.x roles whose canonical trunk input is the actor's observation. Every

@@ -1,10 +1,14 @@
 from typing import Any, Sequence, Union
 
+import logging
+
 import torch
 import torch.nn as nn
 
-from rlmodule import logger
 from rlmodule.source.utils import get_cnn_shape, get_output_size, get_space_size
+
+
+logger = logging.getLogger("rlmodule")
 
 
 LN_POSITION_PRE = "pre"

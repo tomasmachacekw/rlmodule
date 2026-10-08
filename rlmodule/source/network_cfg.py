@@ -4,11 +4,11 @@ from collections.abc import Callable
 from dataclasses import MISSING, field
 import gym
 import gymnasium
+import logging
 
 import torch
 import torch.nn as nn
 
-from rlmodule import logger
 from rlmodule.source.network import (
     CNN,
     GRU,
@@ -23,6 +23,9 @@ from rlmodule.source.network import (
     RnnBase,
     RnnMlp,
 )
+
+
+logger = logging.getLogger("rlmodule")
 
 
 # use isaac-lab native configclass if available to avoid it being declared twice

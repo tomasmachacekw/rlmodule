@@ -3,12 +3,15 @@ from typing import Any, Mapping, Optional, Tuple, Union
 import collections
 import gym
 import gymnasium
+import logging
 
 import torch
 import torch.nn as nn
 
-from rlmodule import logger
 from rlmodule.source.utils import contains_rnn_module
+
+
+logger = logging.getLogger("rlmodule")
 
 
 class Model(torch.nn.Module):
