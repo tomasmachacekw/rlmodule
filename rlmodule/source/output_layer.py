@@ -1,3 +1,4 @@
+import math
 from typing import Union
 
 import gym
@@ -5,6 +6,7 @@ import gymnasium
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
 
 from rlmodule.source.utils import get_output_size, get_space_size
@@ -80,6 +82,16 @@ class GaussianLayer(OutputLayer):
             else torch.sum if cfg.reduction == "sum" else torch.prod if cfg.reduction == "prod" else None
         )
 
+        self._squash = cfg.squash
+        if self._squash and cfg.output_activation is not nn.Identity:
+            raise ValueError(
+                "squash=True bounds the sampled action with tanh, so the mean must be the pre-squash value: "
+                f"set output_activation=nn.Identity (got {cfg.output_activation})"
+            )
+        if cfg.entropy_reduction not in ["mean", "sum"]:
+            raise ValueError("entropy_reduction must be one of 'mean' or 'sum'")
+        self._entropy_reduction = cfg.entropy_reduction
+
         self._net = nn.Sequential(nn.Linear(self._projection_in, self._output_size), cfg.output_activation())
 
         self._log_std = cfg.log_std.class_type(device, self._projection_in, self._output_size, cfg.log_std)
@@ -120,6 +132,9 @@ class GaussianLayer(OutputLayer):
 
         # distribution
         self._distribution = Normal(mean_actions, self._cached_log_std.exp())
+
+        if self._squash:
+            return self._squashed_forward(mean_actions, taken_actions, outputs_dict)
 
         # sample using the reparametrization trick
         actions = self._distribution.rsample()
@@ -162,6 +177,42 @@ class GaussianLayer(OutputLayer):
         # return output * self.instantiator_output_scale, self._log_std, {}
         # return output, self._log_std, output_dict
 
+    # Keeps atanh finite for actions stored at the bound (float32 tanh saturates to 1).
+    _SQUASH_EPS = 1e-6
+
+    def _squashed_forward(self, mean_actions, taken_actions, outputs_dict):
+        """Tanh-squashed Gaussian: ``u ~ N(mean, std)``, ``a = output_scale * tanh(u)``.
+
+        ``self._distribution`` stays the pre-squash Normal over ``u``. ``mean_actions``
+        here is ``output_scale * net(x)`` (``output_activation`` is Identity), so
+        ``mu = mean_actions / output_scale`` in ``u`` space.
+
+        ``log_prob`` applies the change of variables per action dimension before the
+        reduction: ``log p(a) = log N(u) - log(output_scale) - log(1 - tanh(u)^2)``,
+        with ``log(1 - tanh(u)^2) = 2 * (log 2 - u - softplus(-2u))`` for stability.
+        """
+        scale = self._output_scale
+        self._distribution = Normal(mean_actions / scale, self._cached_log_std.exp())
+
+        if taken_actions is None:
+            pre_squash = self._distribution.rsample()
+            actions = scale * torch.tanh(pre_squash)
+        else:
+            actions = taken_actions
+            bound = 1.0 - self._SQUASH_EPS
+            pre_squash = torch.atanh(torch.clamp(taken_actions / scale, -bound, bound))
+
+        log_det = 2.0 * (math.log(2.0) - pre_squash - F.softplus(-2.0 * pre_squash)) + math.log(scale)
+        log_prob = self._distribution.log_prob(pre_squash) - log_det
+        if self._reduction is not None:
+            log_prob = self._reduction(log_prob, dim=-1)
+        if log_prob.dim() != actions.dim():
+            log_prob = log_prob.unsqueeze(-1)
+
+        outputs_dict["mean_actions"] = scale * torch.tanh(mean_actions / scale)
+        outputs_dict["log_prob"] = log_prob
+        return actions, outputs_dict
+
     def get_entropy(self, role: str = "") -> torch.Tensor:
         """Compute and return the entropy of the model
 
@@ -174,11 +225,17 @@ class GaussianLayer(OutputLayer):
 
             >>> entropy = model.get_entropy()
             >>> print(entropy.shape)
-            torch.Size([4096, 8])
+            torch.Size([4096, 8])  # entropy_reduction="mean"; [4096, 1] with "sum"
+
+        With ``squash=True`` this is the entropy of the pre-squash Gaussian: the
+        squashed distribution has no closed form (SAC uses ``-log_prob`` instead).
         """
         if self._distribution is None:
             return torch.tensor(0.0, device=self.device)
-        return self._distribution.entropy().to(self.device)
+        entropy = self._distribution.entropy().to(self.device)
+        if self._entropy_reduction == "sum":
+            entropy = entropy.sum(dim=-1, keepdim=True)
+        return entropy
 
     def get_log_std(self, role: str = "") -> torch.Tensor:
         """Return the log standard deviation of the model

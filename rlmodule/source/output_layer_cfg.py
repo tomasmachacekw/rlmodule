@@ -74,6 +74,24 @@ class GaussianLayerCfg(OutputLayerCfg):
     log_std: LogStdCfg = ParameterLogStdCfg()
     """Module to specify how standard deviation is computed."""
 
+    squash: bool = False
+    """Tanh-squash the sampled action: ``a = output_scale * tanh(u)``, ``u ~ N(mean, std)``.
+
+    ``log_prob`` includes the tanh change-of-variables correction, so it is the density of
+    the bounded action the env executes. This is the SAC actor parameterisation: without it
+    an unbounded Gaussian's entropy term can grow ``std`` without limit while the env clamps
+    every sample to its bound. Requires ``output_activation=nn.Identity``; ``clip_actions``
+    is not applied (the action is already within ``[-output_scale, output_scale]``).
+    """
+
+    entropy_reduction: str = "mean"
+    """How ``get_entropy`` reduces over action dimensions: ``"mean"`` keeps the per-dimension
+    ``(num_samples, num_actions)`` entropy, which skrl's PPO/A2C/RPO then ``.mean()`` over, so
+    the bonus is the average per-dimension entropy (skrl's convention). ``"sum"`` returns the
+    joint entropy ``(num_samples, 1)`` (rsl_rl's convention), making the same
+    ``entropy_loss_scale`` ``num_actions`` times stronger.
+    """
+
 
 @configclass
 class DeterministicLayerCfg(OutputLayerCfg):
