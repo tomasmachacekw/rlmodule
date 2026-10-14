@@ -442,3 +442,34 @@ def test_num_envs_happy_path_returns_expected_shape():
     spec = model.get_specification()
     assert spec["rnn"]["sequence_length"] == L
     assert spec["rnn"]["sizes"] == [(NUM_LAYERS, N, HOUT), (NUM_LAYERS, N, HOUT)]
+
+
+def test_a_truncated_step_resets_the_hidden_state_like_a_terminated_one():
+    """skrl's RNN agents zero the hidden state after a truncated step too, so
+    the model's training forward must reset there: a time-out in the middle
+    of a sampled sequence starts a new episode.
+    """
+    torch.manual_seed(0)
+    model = _build_shared_lstm_model()
+    model.train(True)
+    states = torch.randn(N * L, HIN)
+    h, c = (torch.randn(NUM_LAYERS, N * L, HOUT) for _ in range(2))
+    none = torch.zeros(N * L, 1, dtype=torch.bool)
+    at_1 = none.view(N, L).clone()
+    at_1[:, 1] = True
+    at_1 = at_1.view(N * L, 1)
+
+    def mean_actions(terminated, truncated):
+        model._reset_cache()
+        inputs = {
+            "states": states,
+            "rnn": [h, c],
+            "terminated": terminated,
+            "truncated": truncated,
+        }
+        with torch.no_grad():
+            return model(inputs, role="policy")[1]["mean_actions"]
+
+    truncated = mean_actions(none, at_1)
+    assert torch.allclose(truncated, mean_actions(at_1, none))
+    assert not torch.allclose(truncated, mean_actions(none, none))

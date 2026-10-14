@@ -45,6 +45,21 @@ def _select_trunk_input(inputs: Mapping[str, Union[torch.Tensor, Any]], role: st
     return trunk_input
 
 
+def _episode_ends(inputs: Mapping[str, Union[torch.Tensor, Any]]) -> Optional[torch.Tensor]:
+    """Where a sampled sequence's episodes end, for the recurrent trunk's resets.
+
+    skrl's RNN agents zero the hidden state after a ``terminated`` *or* a
+    ``truncated`` step while collecting, and pass both with every sampled
+    sequence; resetting on ``terminated`` alone would carry a timed-out
+    episode's hidden state into the next episode of the same sequence.
+    """
+    terminated = inputs.get("terminated", None)
+    truncated = inputs.get("truncated", None)
+    if terminated is None or truncated is None:
+        return terminated if terminated is not None else truncated
+    return terminated | truncated
+
+
 class RLModel(Model):
     def __init__(
         self,
@@ -75,7 +90,7 @@ class RLModel(Model):
         if self._input_actions:
             trunk_input = torch.cat((trunk_input, inputs["taken_actions"]), dim=1)
         if self._rnn:
-            output, output_dict = self._net(trunk_input, inputs.get("terminated", None), inputs["rnn"])
+            output, output_dict = self._net(trunk_input, _episode_ends(inputs), inputs["rnn"])
         else:
             output = self._net(trunk_input)
             output_dict = {}
@@ -156,7 +171,7 @@ class SharedRLModel(Model):
             self._reset_cache()
 
             if self._rnn:
-                output, output_dict = self._net(states, inputs.get("terminated", None), inputs["rnn"])
+                output, output_dict = self._net(states, _episode_ends(inputs), inputs["rnn"])
             else:
                 output = self._net(states)
                 output_dict = {}
