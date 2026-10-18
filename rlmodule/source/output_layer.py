@@ -120,6 +120,11 @@ class GaussianLayer(OutputLayer):
             >>> print(actions.shape, log_prob.shape, outputs["mean_actions"].shape)
             torch.Size([4096, 8]) torch.Size([4096, 1]) torch.Size([4096, 8])
         """
+        # ``RLModel.forward`` passes ``inputs["taken_pre_squash"]`` here (``_squashed_forward``).
+        taken_pre_squash = outputs_dict.pop("taken_pre_squash", None)
+        if taken_pre_squash is not None and not self._squash:
+            raise ValueError("taken_pre_squash is the pre-tanh sample of a squashed head, but squash=False")
+
         # Optional per-head pre-projection (see OutputLayerCfg.head).
         head_out = self._head(input)
 
@@ -134,7 +139,7 @@ class GaussianLayer(OutputLayer):
         self._distribution = Normal(mean_actions, self._cached_log_std.exp())
 
         if self._squash:
-            return self._squashed_forward(mean_actions, taken_actions, outputs_dict)
+            return self._squashed_forward(mean_actions, taken_actions, outputs_dict, taken_pre_squash)
 
         # sample using the reparametrization trick
         actions = self._distribution.rsample()
@@ -180,7 +185,7 @@ class GaussianLayer(OutputLayer):
     # Keeps atanh finite for actions stored at the bound (float32 tanh saturates to 1).
     _SQUASH_EPS = 1e-6
 
-    def _squashed_forward(self, mean_actions, taken_actions, outputs_dict):
+    def _squashed_forward(self, mean_actions, taken_actions, outputs_dict, taken_pre_squash=None):
         """Tanh-squashed Gaussian: ``u ~ N(mean, std)``, ``a = output_scale * tanh(u)``.
 
         ``self._distribution`` stays the pre-squash Normal over ``u``. ``mean_actions``
@@ -190,11 +195,20 @@ class GaussianLayer(OutputLayer):
         ``log_prob`` applies the change of variables per action dimension before the
         reduction: ``log p(a) = log N(u) - log(output_scale) - log(1 - tanh(u)^2)``,
         with ``log(1 - tanh(u)^2) = 2 * (log 2 - u - softplus(-2u))`` for stability.
+
+        A sample's ``u`` is returned as ``outputs_dict["pre_squash"]``. Re-evaluating a
+        taken action recovers ``u = atanh(a / output_scale)``, which float32 loses once
+        ``tanh(u)`` rounds to 1 (``|u|`` above about 8): at a std of 0.08 a ``u`` of 12
+        comes back 4.9 off, thousands of nats in ``log_prob``. ``taken_pre_squash``
+        (the stored ``u``) skips the inversion; PPO stores it (``PPOSquash``).
         """
         scale = self._output_scale
         self._distribution = Normal(mean_actions / scale, self._cached_log_std.exp())
 
-        if taken_actions is None:
+        if taken_pre_squash is not None:
+            pre_squash = taken_pre_squash
+            actions = scale * torch.tanh(pre_squash)
+        elif taken_actions is None:
             pre_squash = self._distribution.rsample()
             actions = scale * torch.tanh(pre_squash)
         else:
@@ -211,6 +225,7 @@ class GaussianLayer(OutputLayer):
 
         outputs_dict["mean_actions"] = scale * torch.tanh(mean_actions / scale)
         outputs_dict["log_prob"] = log_prob
+        outputs_dict["pre_squash"] = pre_squash
         return actions, outputs_dict
 
     def get_entropy(self, role: str = "") -> torch.Tensor:

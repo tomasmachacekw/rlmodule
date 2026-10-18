@@ -95,6 +95,8 @@ class RLModel(Model):
             output = self._net(trunk_input)
             output_dict = {}
 
+        if "taken_pre_squash" in inputs:
+            output_dict = {**output_dict, "taken_pre_squash": inputs["taken_pre_squash"]}
         return self._output_layer(output, inputs.get("taken_actions", None), output_dict)
 
 
@@ -182,6 +184,8 @@ class SharedRLModel(Model):
         output, output_dict = self._cached_output
 
         if role == "policy":
+            if "taken_pre_squash" in inputs:
+                output_dict = {**output_dict, "taken_pre_squash": inputs["taken_pre_squash"]}
             return self._policy_output_layer(output, inputs.get("taken_actions", None), output_dict)
         elif role == "value":
             return self._value_output_layer(output, inputs.get("taken_actions", None), output_dict)

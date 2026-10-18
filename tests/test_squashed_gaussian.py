@@ -68,6 +68,40 @@ def test_squashed_log_prob_is_finite_at_the_bound() -> None:
     assert torch.isfinite(out["log_prob"]).all()
 
 
+def _saturated(mean: float, std: float) -> GaussianLayer:
+    """A squashed layer whose pre-squash mean is *mean* everywhere, at *std*."""
+    layer = _squashed(log_std=ParameterLogStdCfg(initial_log_std=math.log(std)))
+    with torch.no_grad():
+        layer._net[0].weight.zero_()
+        layer._net[0].bias.fill_(mean)
+    return layer
+
+
+def test_the_sample_returns_its_pre_squash_value() -> None:
+    layer = _squashed(output_scale=2.0)
+    actions, out = layer(torch.randn(64, N_IN), None, {})
+    torch.testing.assert_close(2.0 * torch.tanh(out["pre_squash"]), actions)
+
+
+def test_taken_pre_squash_gives_the_sampled_log_prob_where_tanh_saturates() -> None:
+    # Run 89b's failure: at |u| ~ 12 float32 tanh is 1, so atanh(a) cannot recover u,
+    # and at a std of 0.08 the re-evaluated log_prob is thousands of nats off.
+    layer = _saturated(mean=12.0, std=0.08)
+    x = torch.randn(256, N_IN)
+    actions, out = layer(x, None, {})
+    assert out["pre_squash"].abs().min() > 11.0
+    _, exact = layer(x, actions, {"taken_pre_squash": out["pre_squash"]})
+    torch.testing.assert_close(exact["log_prob"], out["log_prob"])
+    _, inverted = layer(x, actions, {})
+    assert (inverted["log_prob"] - out["log_prob"]).abs().max() > 1000.0
+
+
+def test_taken_pre_squash_on_an_unsquashed_layer_is_refused() -> None:
+    layer = _layer()
+    with pytest.raises(ValueError, match="squash=False"):
+        layer(torch.randn(3, N_IN), torch.zeros(3, N_ACT), {"taken_pre_squash": torch.zeros(3, N_ACT)})
+
+
 def test_squashed_mean_action_is_tanh_of_the_mean() -> None:
     layer = _squashed(output_scale=2.0)
     x = torch.randn(8, N_IN)
