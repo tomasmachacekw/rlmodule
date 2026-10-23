@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- A recurrent model resets its hidden state where an episode was truncated, not
+  only where it terminated: a sequence that crosses a time-limit reset no longer
+  carries the previous episode's hidden state.
+- A squashed Gaussian head re-evaluates a stored sample from its pre-tanh value.
+  Sampling returns `outputs["pre_squash"]`, and `RLModel` / `SharedRLModel` pass
+  `inputs["taken_pre_squash"]` to the layer, which then uses that `u` exactly.
+  Recovering `u` with `atanh(a / scale)` (still the path without it) loses float32
+  precision for `|u|` above ~8.
+
 ## 0.2.0
 
 ### Added
